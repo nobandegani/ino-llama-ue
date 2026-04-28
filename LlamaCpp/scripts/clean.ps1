@@ -12,10 +12,10 @@ $PluginDir   = (Resolve-Path (Join-Path $LlamaCppDir "..")).Path
 
 $Targets = @(
     (Join-Path $LlamaCppDir ".cache"),
-    (Join-Path $PluginDir   "Source\ThirdParty\InoLlamaCpp\Public"),
-    (Join-Path $PluginDir   "Source\ThirdParty\InoLlamaCpp\.llamacpp_version"),
-    (Join-Path $PluginDir   "Binaries\ThirdParty\InoLlamaCpp\Win64"),
-    (Join-Path $PluginDir   "Binaries\ThirdParty\InoLlamaCpp\Android")
+    (Join-Path $PluginDir   "Source\ThirdParty\Public"),
+    (Join-Path $PluginDir   "Source\ThirdParty\Win64"),
+    (Join-Path $PluginDir   "Source\ThirdParty\Android"),
+    (Join-Path $PluginDir   "Source\ThirdParty\.llamacpp_version")
 )
 
 Write-Host "=== llama.cpp clean ===" -ForegroundColor Cyan

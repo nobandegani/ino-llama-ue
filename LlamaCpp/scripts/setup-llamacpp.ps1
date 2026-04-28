@@ -1,15 +1,16 @@
 # setup-llamacpp.ps1
 #
-# One-time setup (idempotent) for the llama.cpp half of the InoAgents plugin.
+# One-time setup (idempotent) for the InoLlama plugin.
 #
 # Downloads upstream's prebuilt llama.cpp release artifacts for Win64 + Android
-# arm64, stages the headers under
-#   Plugins/InoAgents/Source/ThirdParty/InoLlamaCpp/Public/
-# and the runtime .dll / .so files under
-#   Plugins/InoAgents/Binaries/ThirdParty/InoLlamaCpp/
+# arm64, stages everything (headers + DLLs/.so) under a flat tree:
+#   Plugins/InoLlama/Source/ThirdParty/
+#     Public/                          llama.cpp C API headers
+#     Win64/                           llama.dll, ggml*.dll, libomp140.x86_64.dll
+#     Android/arm64-v8a/               libllama.so, libggml*.so
 #
 # Pinned version lives in:
-#   Plugins/InoAgents/LlamaCpp/LLAMACPP_VERSION   (e.g. "b8883")
+#   Plugins/InoLlama/LlamaCpp/LLAMACPP_VERSION   (e.g. "b8955")
 # Bump + re-run this script to update.
 #
 # Why prebuilts (not build-from-source like LiteRT-LM):
@@ -68,13 +69,11 @@
 #   total, small. Single-source-of-truth is the git tag, which matches
 #   the binaries we just downloaded.
 #
-# Artifacts on disk after this runs (assuming llama.cpp b8883):
+# Artifacts on disk after this runs (assuming llama.cpp b8955):
 #
-#   Source/ThirdParty/InoLlamaCpp/
-#     Public/                           (llama.h, ggml*.h — public C API)
+#   Source/ThirdParty/
 #     .llamacpp_version                 (stamp file for idempotency check)
-#
-#   Binaries/ThirdParty/InoLlamaCpp/
+#     Public/                           (llama.h, ggml*.h — public C API)
 #     Win64/
 #       llama.dll                       (main library)
 #       ggml.dll                        (dispatcher)
@@ -103,11 +102,14 @@ $PluginDir    = (Resolve-Path (Join-Path $LlamaCppDir "..")).Path
 $VersionFile  = Join-Path $LlamaCppDir "LLAMACPP_VERSION"
 $CacheDir     = Join-Path $LlamaCppDir ".cache"
 
-# Staging destinations.
-$ThirdPartyDir    = Join-Path $PluginDir "Source\ThirdParty\InoLlamaCpp"
+# Staging destinations. Everything (headers + Win64 DLLs + Android .so)
+# lives under Source/ThirdParty/ in a flat layout — Public/, Win64/,
+# Android/<arch>/ — matching the sibling InoLiteRT and InoOnnx plugins.
+# No Binaries/ThirdParty/ tree.
+$ThirdPartyDir    = Join-Path $PluginDir "Source\ThirdParty"
 $PublicIncDir     = Join-Path $ThirdPartyDir "Public"
-$Win64BinStageDir = Join-Path $PluginDir "Binaries\ThirdParty\InoLlamaCpp\Win64"
-$Arm64BinStageDir = Join-Path $PluginDir "Binaries\ThirdParty\InoLlamaCpp\Android\arm64-v8a"
+$Win64BinStageDir = Join-Path $ThirdPartyDir "Win64"
+$Arm64BinStageDir = Join-Path $ThirdPartyDir "Android\arm64-v8a"
 
 # DLLs to SKIP on Windows (CLI-only / unused features).
 $WinSkipList = @(
