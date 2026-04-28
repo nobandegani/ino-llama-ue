@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
 
-InoLlamaCpp — Unreal Plugin Language (UPL) file for Android APK
-packaging of the llama.cpp shared libraries.
+InoLlama — Unreal Plugin Language (UPL) file for Android APK packaging
+of the llama.cpp shared libraries.
 
-Referenced from InoLlamaCpp.Build.cs via
+Referenced from InoLlama.Build.cs via
     AdditionalPropertiesForReceipt.Add("AndroidPlugin", "<this file>")
 
-Two concerns handled here, matching the proven pattern from
-InoOnnxRuntime_UPL_Android.xml:
+Two concerns handled here, matching the proven pattern from the sibling
+InoOnnx plugin's InoOnnx_UPL_Android.xml:
 
   1. Java-side loadLibrary: emit System.loadLibrary("llama") in the
      generated GameActivity Java so libllama.so is resident before
@@ -24,17 +24,16 @@ InoOnnxRuntime_UPL_Android.xml:
      loaded-libs list, which isn't wrong but is unnecessary.
 
   2. APK staging: copy every .so we ship from the plugin's
-     Binaries/ThirdParty/InoLlamaCpp/Android/arm64-v8a/ into the APK's
-     lib/arm64-v8a/. Both the preloaded libraries AND the runtime-
-     dlopen'd variants must be there. Build.cs RuntimeDependencies
-     alone does NOT stage a .so into lib/<arch>/ of the APK —
-     explicit <copyFile> in <resourceCopies> is what gets it there
-     (empirically confirmed during InoOnnxRuntime integration).
+     Source/ThirdParty/Android/arm64-v8a/ into the APK's lib/arm64-v8a/.
+     Both the preloaded libraries AND the runtime-dlopen'd variants
+     must be there. Build.cs RuntimeDependencies alone does NOT stage
+     a .so into lib/<arch>/ of the APK — explicit <copyFile> in
+     <resourceCopies> is what gets it there.
 
-Path variable gotchas (same as InoOnnxRuntime_UPL_Android.xml):
+Path variable gotchas (lessons from the InoOnnx UPL):
 
   $S(AbsPluginDir)  — resolves to THIS MODULE's directory, i.e.
-                       Plugins/InoAgents/Source/ThirdParty/InoLlamaCpp/
+                       Plugins/InoLlama/Source/InoLlama/
                        (despite the "Plugin" in the name — that's how
                        UE's UPL engine labels it).
   $S(PluginDir)     — does NOT exist as a UPL variable; using it
@@ -44,8 +43,8 @@ Path variable gotchas (same as InoOnnxRuntime_UPL_Android.xml):
   $S(Architecture)  — arm64-v8a, etc.
 
 Our .so files live at
-    Plugins/InoAgents/Binaries/ThirdParty/InoLlamaCpp/Android/arm64-v8a/*.so
-which is 3 levels up from $S(AbsPluginDir), then down through Binaries.
+    Plugins/InoLlama/Source/ThirdParty/Android/arm64-v8a/*.so
+which is one level up from $S(AbsPluginDir), then down through ThirdParty.
 
 Docs: https://docs.unrealengine.com/en-US/Sharing/Reference/UnrealPluginLanguage/
 
@@ -62,22 +61,22 @@ Docs: https://docs.unrealengine.com/en-US/Sharing/Reference/UnrealPluginLanguage
     dir. llama.cpp upstream only publishes arm64 Android prebuilts.
     -->
     <init>
-        <log text="InoLlamaCpp UPL init"/>
+        <log text="InoLlama UPL init"/>
         <setBool result="bSupported" value="false"/>
         <isArch arch="arm64-v8a">
             <setBool result="bSupported" value="true"/>
         </isArch>
         <if condition="bSupported">
             <false>
-                <log text="InoLlamaCpp: unsupported architecture $S(Architecture), skipping llama.cpp staging"/>
+                <log text="InoLlama: unsupported architecture $S(Architecture), skipping llama.cpp staging"/>
             </false>
         </if>
     </init>
 
     <!--
     soLoadLibrary: emit System.loadLibrary("llama") in the Java launcher
-    activity so libllama.so is resident by the time InoLlamaCppModule::
-    Init's dlopen call runs.
+    activity so libllama.so is resident by the time the consumer's
+    StartupModule's dlopen call runs.
 
     Only the top-of-chain library needs preload — libllama.so's
     DT_NEEDED on libggml.so cascades through the Android dynamic linker
@@ -85,9 +84,9 @@ Docs: https://docs.unrealengine.com/en-US/Sharing/Reference/UnrealPluginLanguage
     dlopen'd at runtime by libggml.so's backend auto-loader and do not
     need to be preloaded via soLoadLibrary.
 
-    Library name is "llama" (not "InoLlamaCpp") because we chose not to
-    rename the .so files; see README.md for rationale. Android convention:
-    lib<name>.so is referenced via System.loadLibrary("<name>").
+    Library name is "llama" (not "InoLlama") because we chose not to
+    rename the .so files; see InoLlama.Build.cs for rationale. Android
+    convention: lib<name>.so is referenced via System.loadLibrary("<name>").
 
     failmsg surfaces in logcat as
         "AndroidJNI failed to load library 'llama'. Reason: <failmsg>"
@@ -104,46 +103,46 @@ Docs: https://docs.unrealengine.com/en-US/Sharing/Reference/UnrealPluginLanguage
 
     If the setup script adds / removes variants in a future llama.cpp
     release, update this list and the RequiredAndroid array in
-    InoLlamaCpp.Build.cs to match.
+    InoLlama.Build.cs to match.
     -->
     <resourceCopies>
         <if condition="bSupported">
             <true>
                 <!-- Main library + core ggml. -->
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libllama.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libllama.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libllama.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-base.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-base.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-base.so"/>
 
                 <!-- CPU variants (ARM tier — runtime picker chooses). -->
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv8.0_1.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv8.0_1.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv8.0_1.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv8.2_1.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv8.2_1.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv8.2_1.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv8.2_2.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv8.2_2.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv8.2_2.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv8.6_1.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv8.6_1.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv8.6_1.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv9.0_1.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv9.0_1.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv9.0_1.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv9.2_1.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv9.2_1.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv9.2_1.so"/>
                 <copyFile
-                    src="$S(AbsPluginDir)/../../../Binaries/ThirdParty/InoLlamaCpp/Android/$S(Architecture)/libggml-cpu-android_armv9.2_2.so"
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv9.2_2.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv9.2_2.so"/>
 
-                <log text="InoLlamaCpp: copied 10 .so files to lib/$S(Architecture)/"/>
+                <log text="InoLlama: copied 10 .so files to lib/$S(Architecture)/"/>
             </true>
         </if>
     </resourceCopies>
