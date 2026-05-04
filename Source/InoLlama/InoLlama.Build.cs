@@ -101,8 +101,9 @@ public class InoLlama : ModuleRules
 		//   ggml-*.dll. Renaming any would require PE-patching every static
 		//   import AND replacing the glob scanner with explicit
 		//   ggml_backend_load(full_path) calls. No UE 5.7 plugin currently
-		//   ships llama.cpp, so no concrete collision today. The directory
-		//   isolation (Source/ThirdParty/Win64/ as a unique staging path)
+		//   ships llama.cpp, so no concrete collision today. Directory
+		//   isolation per platform (Source/ThirdParty/Win64/ +
+		//   Source/ThirdParty/Android/arm64-v8a/ as unique staging paths)
 		//   is sufficient.
 		//
 		// Vulkan backend note:
