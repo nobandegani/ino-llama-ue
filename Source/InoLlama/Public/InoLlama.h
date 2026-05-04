@@ -15,6 +15,10 @@
 #include "llama.h"
 #include "ggml-backend.h"
 
+// Generic Blueprint-friendly param structs used by the helper functions
+// below. Pulled in here so consumers only need this single header.
+#include "InoLlamaTypes.h"
+
 /**
  * Shared log category for the InoLlama plugin and the llama.cpp loader
  * code that ships with it. Consumer plugins (InoAgents, etc.) have
@@ -257,4 +261,39 @@ namespace InoAgents::LlamaCpp
      * Callers MUST null-check before dereferencing.
      */
     INOLLAMA_API const FLlamaCppApi* GetApi();
+
+    // ========================================================================
+    //  High-level helpers — generic for any GGUF consumer
+    // ========================================================================
+
+    /**
+     * Load a GGUF model with the given params. Wraps the
+     * llama_model_default_params + ApplyTo + llama_model_load_from_file
+     * boilerplate that every consumer would otherwise repeat, and adds
+     * file-existence check, error logging, and load-timing diagnostics.
+     *
+     * Returns nullptr on any failure (with diagnostic in *OutError when
+     * OutError is non-null, plus a Log/Error line either way).
+     *
+     * Callers own the returned llama_model* — release with
+     * GetApi()->llama_model_free(Model) when done.
+     */
+    INOLLAMA_API struct llama_model* LoadModelFromFile(
+        const FString& ModelPath,
+        const FInoLlamaModelParams& Params,
+        FString* OutError = nullptr);
+
+    /**
+     * Create an inference context for a previously loaded model. Wraps
+     * llama_context_default_params + ApplyTo + llama_init_from_model.
+     *
+     * Returns nullptr on any failure.
+     *
+     * Callers own the returned llama_context* — release with
+     * GetApi()->llama_free(Context) when done.
+     */
+    INOLLAMA_API struct llama_context* CreateContext(
+        struct llama_model* Model,
+        const FInoLlamaContextParams& Params,
+        FString* OutError = nullptr);
 }
