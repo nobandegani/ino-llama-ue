@@ -326,6 +326,42 @@ required instruction set isn't available. Only the variants that pass
 survive in the registered-backends list; the rest are silently
 unregistered.
 
+### UE 5.7 Live Coding interaction (Win64 editor)
+
+UE 5.7's Live Coding scans every entry in the editor target's
+`RuntimeDependencies` list and tries to "enable" each as a UE module
+for hot-patching. With 14 ggml-cpu variants of which only one ever
+loads (the host-CPU match), Live Coding logs 13 spurious
+`Cannot enable module X because it is not loaded by this process`
+Errors at editor startup. The legacy `StagedFileType.SystemNonUFS`
+hint that older UE versions used to skip these is no longer respected
+in 5.7.
+
+The fix in `InoLlama.Build.cs` is to **exclude the variant glob from
+the editor target's `RuntimeDependencies`**:
+
+```csharp
+if (Target.Type != TargetType.Editor && Directory.Exists(Win64Dir))
+{
+    // ... add ggml-cpu-*.dll entries ...
+}
+```
+
+The editor still loads the variants at runtime via
+`ggml_backend_load_all_from_path`'s directory scan of
+`Source/ThirdParty/Win64/` — `RuntimeDependencies` isn't on the
+load-path side of the equation. Game/Server targets keep the
+declarations so the cook + stage step for shipping builds still
+packages every variant. Zero behavior change on either side; Live
+Coding just stops complaining about DLLs it can't patch.
+
+The `RequiredWin64` DLLs (`llama.dll`, `ggml.dll`, `ggml-base.dll`,
+`ggml-vulkan.dll`, `libomp140.x86_64.dll`) ARE kept in the editor
+target's `RuntimeDependencies` because they're actually loaded by
+the editor process — Live Coding finds them in the loaded-modules
+list and is happy. The Android branch doesn't need an equivalent
+guard because Android targets are never `TargetType.Editor`.
+
 ## Authoritative references
 
 Upstream sources:
