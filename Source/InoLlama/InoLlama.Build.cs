@@ -159,20 +159,28 @@ public class InoLlama : ModuleRules
 			// CPU microarchitecture variants. llama.cpp's runtime backend
 			// picker selects the optimal one per-CPU at model-load time —
 			// only ONE variant actually gets loaded into the process; the
-			// other 13 remain on disk. Enumerate the staged dir so we
-			// don't have to hardcode all 14 tier names — the exact set may
-			// shift between upstream releases.
+			// other 13 dlopen, fail their CPU-feature probe, and unload.
+			// Enumerate the staged dir so we don't have to hardcode all 14
+			// tier names — the exact set may shift between upstream releases.
 			//
-			// Staging type MUST be StagedFileType.SystemNonUFS here (not
-			// the default NonUFS). Reason: the default causes Live Coding
-			// to scan every .dll in RuntimeDependencies as a potential
-			// hot-patch target, producing 13 "Cannot enable module X
-			// because it is not loaded by this process" error lines on
-			// every Live Coding compile — one per unused variant. Marking
-			// them SystemNonUFS tells UBT they're system-ish files that
-			// LiveCoding should skip, while still getting them staged
-			// into packaged builds.
-			if (Directory.Exists(Win64Dir))
+			// Editor target is intentionally excluded. Reason: UE 5.7's
+			// Live Coding scans every entry in the .target file's
+			// RuntimeDependencies and tries to "enable" each as a UE module,
+			// producing 13 "Cannot enable module X because it is not loaded
+			// by this process" errors at editor startup — one per variant
+			// the runtime probe rejected. The legacy StagedFileType.SystemNonUFS
+			// hint that older UE versions used to skip Live Coding scans is
+			// no longer respected in 5.7, so we just keep the variants out
+			// of the editor's RuntimeDependencies entirely.
+			//
+			// Editor still loads them at runtime via ggml_backend_load_all_from_path's
+			// directory scan of Source/ThirdParty/Win64/ (the files are
+			// physically present regardless of the RuntimeDependencies
+			// declaration). Game/Server targets DO list them in
+			// RuntimeDependencies, so the cook + stage step for shipping
+			// builds picks them up correctly. Type is still SystemNonUFS
+			// for cooked builds for parity with packaging conventions.
+			if (Target.Type != TargetType.Editor && Directory.Exists(Win64Dir))
 			{
 				string[] cpuVariants = Directory.GetFiles(Win64Dir, "ggml-cpu-*.dll");
 				foreach (string path in cpuVariants)
