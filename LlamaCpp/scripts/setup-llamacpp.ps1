@@ -6,16 +6,15 @@
 #
 #   Win64 (prebuilt download)
 #     Downloads upstream's `llama-<tag>-bin-win-vulkan-x64.zip` and stages
-#     ~19 DLLs (llama, ggml, 14 CPU microarch variants, Vulkan, OpenMP) to
-#     Source/ThirdParty/Win64/. Headers are fetched from
-#     raw.githubusercontent.com at the same tag and placed in
-#     Source/ThirdParty/Public/. No build toolchain required.
+#     19 DLLs (llama, ggml, 14 CPU microarch variants, Vulkan, OpenMP) to
+#     Source/ThirdParty/Win64/. No build toolchain required for this
+#     platform.
 #
 #   Android arm64-v8a (from source)
 #     Builds llama.cpp from the LlamaCpp/vendor/llama.cpp/ submodule
 #     (which MUST be checked out at the same `LLAMACPP_VERSION` tag) using
 #     Android Studio's NDK r28b + the SDK's bundled ninja, with Vulkan
-#     enabled via NDK's bundled glslc. Stages ~10 .so files (libllama,
+#     enabled via NDK's bundled glslc. Stages 11 .so files (libllama,
 #     libggml, libggml-base, 7 ARM tier libggml-cpu-android_*.so, plus
 #     libggml-vulkan.so) to Source/ThirdParty/Android/arm64-v8a/.
 #
@@ -25,6 +24,11 @@
 #     __ANDROID__ hostile bits; libvulkan.so is an Android platform
 #     library from API 24+). Building ourselves is the only path to
 #     Android GPU offload.
+#
+#   Public C API headers (both platforms)
+#     Staged from the vendor submodule — Source/ThirdParty/Public/llama.h,
+#     ggml.h, ggml-{alloc,backend,cpu,opt}.h, gguf.h. Same source-of-truth
+#     as the Android build inputs.
 #
 # Pinned version lives in:
 #   LlamaCpp/LLAMACPP_VERSION                    (e.g. "b9016")
@@ -525,11 +529,11 @@ Write-Host "  Staged $AndroidStaged Android .so files total; $($AndroidCpuStaged
 Write-Host ""
 
 #=====================================================================
-# 7. Public headers from raw.githubusercontent.com at the pinned tag
+# 8. Public C API headers (from vendor submodule, both platforms)
 #=====================================================================
-# Headers aren't bundled in the Windows release ZIP. Use the vendor submodule
-# for headers when possible (already on disk at the correct tag), with
-# raw.githubusercontent.com as a fallback.
+# Headers aren't bundled in the Windows release ZIP. We stage them
+# from the vendor submodule (already on disk at the matching tag,
+# verified above) — same source-of-truth as the Android build inputs.
 Write-Host "=== Public C API headers ===" -ForegroundColor Cyan
 Write-Host "--- Staging from vendor submodule ---" -ForegroundColor Yellow
 
@@ -558,7 +562,7 @@ foreach ($name in $Headers.Keys) {
 Write-Host ""
 
 #=====================================================================
-# 8. Write version stamp
+# 9. Write version stamp
 #=====================================================================
 Set-Content -Path $StampFile -Value $Version -NoNewline -Encoding ASCII
 
