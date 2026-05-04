@@ -1,128 +1,82 @@
 # setup-llamacpp.ps1
 #
-# One-time setup (idempotent) for the InoLlama plugin.
+# Hybrid setup (idempotent) for the InoLlama plugin.
 #
-# Downloads upstream's prebuilt llama.cpp release artifacts for Win64 + Android
-# arm64, stages everything (headers + DLLs/.so) under a flat tree:
-#   Plugins/InoLlama/Source/ThirdParty/
-#     Public/                          llama.cpp C API headers
-#     Win64/                           llama.dll, ggml*.dll, libomp140.x86_64.dll
-#     Android/arm64-v8a/               libllama.so, libggml*.so
+# Two staging paths from a single pinned llama.cpp version:
+#
+#   Win64 (prebuilt download)
+#     Downloads upstream's `llama-<tag>-bin-win-vulkan-x64.zip` and stages
+#     ~19 DLLs (llama, ggml, 14 CPU microarch variants, Vulkan, OpenMP) to
+#     Source/ThirdParty/Win64/. Headers are fetched from
+#     raw.githubusercontent.com at the same tag and placed in
+#     Source/ThirdParty/Public/. No build toolchain required.
+#
+#   Android arm64-v8a (from source)
+#     Builds llama.cpp from the LlamaCpp/vendor/llama.cpp/ submodule
+#     (which MUST be checked out at the same `LLAMACPP_VERSION` tag) using
+#     Android Studio's NDK r28b + the SDK's bundled ninja, with Vulkan
+#     enabled via NDK's bundled glslc. Stages ~10 .so files (libllama,
+#     libggml, libggml-base, 7 ARM tier libggml-cpu-android_*.so, plus
+#     libggml-vulkan.so) to Source/ThirdParty/Android/arm64-v8a/.
+#
+#     Why from source: upstream's `llama-<tag>-bin-android-arm64.tar.gz`
+#     release asset is CPU-only — they do not publish Android Vulkan
+#     prebuilts. The Vulkan backend code is Android-compatible (no
+#     __ANDROID__ hostile bits; libvulkan.so is an Android platform
+#     library from API 24+). Building ourselves is the only path to
+#     Android GPU offload.
 #
 # Pinned version lives in:
-#   Plugins/InoLlama/LlamaCpp/LLAMACPP_VERSION   (e.g. "b8955")
-# Bump + re-run this script to update.
+#   LlamaCpp/LLAMACPP_VERSION                    (e.g. "b9016")
+#   LlamaCpp/vendor/llama.cpp                    (git submodule, MUST match)
+# Bump LLAMACPP_VERSION + `git -C vendor/llama.cpp checkout <tag>` to update.
 #
-# Why prebuilts (not build-from-source like LiteRT-LM):
-#   - Upstream ships exactly the artifacts we need for both platforms on
-#     every tagged release. Zero toolchain requirements on dev machines
-#     (no CMake, no MSVC, no NDK, no Vulkan SDK). Mirrors the ONNX Runtime
-#     setup pattern.
-#   - llama.cpp has a stable, well-exported public C API and their CI
-#     produces drop-in DLLs. No custom Bazel target or export-visibility
-#     quirks like LiteRT-LM required.
+# Naming policy (IMPORTANT): no .so/.dll renames. llama.cpp ships an
+# interconnected DLL graph (llama -> ggml -> ggml-base, plus runtime glob
+# scan for ggml-*.{dll,so}). Renaming would require PE/ELF import-table
+# patches and replacing the glob scanner with explicit
+# ggml_backend_load(full_path) calls. Directory isolation
+# (Source/ThirdParty/Win64/ + Source/ThirdParty/Android/arm64-v8a/) is the
+# collision-avoidance strategy. See InoLlama.Build.cs for rationale.
 #
-# Platform matrix:
-#   - Win64:  `llama-<tag>-bin-win-vulkan-x64.zip` (CPU + Vulkan in one bundle;
-#             pick Vulkan so we get both backends — CPU is always loaded as
-#             fallback via the co-shipped ggml-cpu-*.dll variants)
-#   - Android arm64: `llama-<tag>-bin-android-arm64.tar.gz` (CPU only — upstream
-#                    does not publish Android Vulkan artifacts in releases)
+# CPU variant strategy: stage ALL variants. llama.cpp's runtime backend
+# picker probes the host CPU and registers only those that pass; the
+# rest sit on disk unused. Total footprint ~15 MB across all variants.
 #
-# Naming policy (IMPORTANT — don't add renames without reading this):
-#   Unlike InoOnnxRuntime (which renames onnxruntime.dll -> InoOnnxRuntime.dll
-#   and DirectML.dll -> InoDml.dll to dodge verified base-name-cache
-#   collisions with UE's NNE / Marketplace plugins), we ship all llama.cpp
-#   binaries under their ORIGINAL filenames.
+# Skip list:
+#   - llama-common (CLI shared code only, no public symbols)
+#   - ggml-rpc    (distributed inference, not used)
+#   - libmtmd     (multimodal CLI helper, not exposed via llama.h)
 #
-#   Reason: llama.cpp ships as an interconnected graph of 20+ DLLs with
-#   PE import tables that reference each other by base name
-#   (llama.dll -> ggml.dll -> ggml-base.dll, plus runtime loading of
-#   ggml-cpu-*.dll / ggml-vulkan.dll via ggml_backend_load_all scanning
-#   for ggml-*.dll patterns). Renaming any of them would require patching
-#   the PE import tables in all dependents AND wiring explicit
-#   ggml_backend_load(full_path) calls to replace the glob scanner.
-#
-#   No UE 5.7 plugin currently ships llama.cpp, so no concrete collision
-#   exists today. If a future collision emerges, upgrade to rename +
-#   PE-patch as a scoped follow-up. The directory isolation
-#   (Binaries/ThirdParty/InoLlamaCpp/Win64/ as a unique location) is
-#   sufficient for now.
-#
-# CPU variant strategy:
-#   Upstream ships ~15 Windows CPU variants per tier (haswell, sandybridge,
-#   icelake, alderlake, zen4, sse42, x64, etc.) and ~7 Android ARM tiers
-#   (armv8.0, armv8.2, armv8.6, armv9.0, armv9.2). We stage ALL of them
-#   so llama.cpp's runtime backend-picker can select the optimal one at
-#   model-load time. Total added footprint is small (~15 MB Windows CPU
-#   variants combined).
-#
-# Skip list (files we deliberately DO NOT stage):
-#   - *.exe / executables without extension on Android (CLI tools)
-#   - llama-common.dll / libllama-common.so (CLI shared code only)
-#   - ggml-rpc.dll / libggml-rpc.so (distributed inference, not used)
-#   - libmtmd.so (multimodal CLI helper, not exposed via llama.h)
-#
-# Public headers:
-#   Not bundled in the Windows release ZIP. We fetch them directly from
-#   raw.githubusercontent.com at the pinned tag's commit. Six headers
-#   total, small. Single-source-of-truth is the git tag, which matches
-#   the binaries we just downloaded.
-#
-# Artifacts on disk after this runs (assuming llama.cpp b8955):
-#
-#   Source/ThirdParty/
-#     .llamacpp_version                 (stamp file for idempotency check)
-#     Public/                           (llama.h, ggml*.h — public C API)
-#     Win64/
-#       llama.dll                       (main library)
-#       ggml.dll                        (dispatcher)
-#       ggml-base.dll                   (base implementation)
-#       ggml-cpu-*.dll                  (all CPU variants: haswell,
-#                                        sandybridge, icelake, alderlake,
-#                                        cannonlake, cascadelake, cooperlake,
-#                                        ivybridge, piledriver,
-#                                        sapphirerapids, skylakex, sse42,
-#                                        x64, zen4 = 14 total)
-#       ggml-vulkan.dll                 (Vulkan backend)
-#       libomp140.x86_64.dll            (MSVC OpenMP redistributable)
-#     Android/arm64-v8a/
-#       libllama.so                     (main library)
-#       libggml.so                      (dispatcher)
-#       libggml-base.so                 (base implementation)
-#       libggml-cpu-android_*.so        (CPU variants: armv8.0_1, armv8.2_1,
-#                                        armv8.2_2, armv8.6_1, armv9.0_1,
-#                                        armv9.2_1, armv9.2_2 = 7 total)
+# Idempotency stamp: Source/ThirdParty/.llamacpp_version. If the stamp
+# matches LLAMACPP_VERSION AND every required staged file is present
+# (now including libggml-vulkan.so on Android), we skip both the Win64
+# download and the Android build. To force re-stage: delete the stamp
+# file or run clean.ps1.
 
 $ErrorActionPreference = "Stop"
 
+#---------------------------------------------------------------------
+# 0. Paths
+#---------------------------------------------------------------------
 $ScriptDir    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LlamaCppDir  = (Resolve-Path (Join-Path $ScriptDir "..")).Path
 $PluginDir    = (Resolve-Path (Join-Path $LlamaCppDir "..")).Path
-$VersionFile  = Join-Path $LlamaCppDir "LLAMACPP_VERSION"
+$VersionFile        = Join-Path $LlamaCppDir "LLAMACPP_VERSION"
+$VulkanHeadersFile  = Join-Path $LlamaCppDir "VULKAN_HEADERS_VERSION"
 $CacheDir     = Join-Path $LlamaCppDir ".cache"
+$VendorSrcDir = Join-Path $LlamaCppDir "vendor\llama.cpp"
 
-# Staging destinations. Everything (headers + Win64 DLLs + Android .so)
-# lives under Source/ThirdParty/ in a flat layout — Public/, Win64/,
-# Android/<arch>/ — matching the sibling InoLiteRT and InoOnnx plugins.
-# No Binaries/ThirdParty/ tree.
 $ThirdPartyDir    = Join-Path $PluginDir "Source\ThirdParty"
 $PublicIncDir     = Join-Path $ThirdPartyDir "Public"
 $Win64BinStageDir = Join-Path $ThirdPartyDir "Win64"
 $Arm64BinStageDir = Join-Path $ThirdPartyDir "Android\arm64-v8a"
 
-# DLLs to SKIP on Windows (CLI-only / unused features).
-$WinSkipList = @(
-    "llama-common.dll",
-    "ggml-rpc.dll"
-)
+$StampFile = Join-Path $ThirdPartyDir ".llamacpp_version"
 
-# .so files to SKIP on Android (CLI-only / unused features).
-$AndroidSkipList = @(
-    "libllama-common.so",
-    "libggml-rpc.so",
-    "libmtmd.so"
-)
+# Skip lists
+$WinSkipList     = @("llama-common.dll", "ggml-rpc.dll")
+$AndroidSkipList = @("libllama-common.so", "libggml-rpc.so", "libmtmd.so")
 
 # Public headers to fetch from raw.githubusercontent.com at the pinned tag.
 # Keys are destination filenames (placed flat into Public/), values are
@@ -134,7 +88,7 @@ $Headers = [ordered]@{
     "ggml-backend.h" = "ggml/include/ggml-backend.h"
     "ggml-cpu.h"     = "ggml/include/ggml-cpu.h"
     "ggml-opt.h"     = "ggml/include/ggml-opt.h"
-    "gguf.h"         = "ggml/include/gguf.h"   # included by llama.h
+    "gguf.h"         = "ggml/include/gguf.h"
 }
 
 #---------------------------------------------------------------------
@@ -145,59 +99,57 @@ if (-not (Test-Path $VersionFile)) {
 }
 $Version = (Get-Content $VersionFile -Raw).Trim()
 if ($Version -notmatch '^b\d+$') {
-    Write-Error "LLAMACPP_VERSION must be a build tag like 'b8883'. Got: '$Version'"
+    Write-Error "LLAMACPP_VERSION must be a build tag like 'b9016'. Got: '$Version'"
+}
+
+if (-not (Test-Path $VulkanHeadersFile)) {
+    Write-Error "VULKAN_HEADERS_VERSION file not found at $VulkanHeadersFile"
+}
+$VulkanHeadersVersion = (Get-Content $VulkanHeadersFile -Raw).Trim()
+if ($VulkanHeadersVersion -notmatch '^vulkan-sdk-\d+\.\d+\.\d+\.\d+$') {
+    Write-Error "VULKAN_HEADERS_VERSION must be a tag like 'vulkan-sdk-1.4.341.0'. Got: '$VulkanHeadersVersion'"
 }
 
 Write-Host ""
 Write-Host "=== llama.cpp setup ===" -ForegroundColor Cyan
-Write-Host "llama.cpp version: $Version (from LLAMACPP_VERSION)"
-Write-Host "Plugin dir:        $PluginDir"
-Write-Host "LlamaCpp dir:      $LlamaCppDir"
-Write-Host "Cache dir:         $CacheDir"
+Write-Host "llama.cpp version:    $Version (from LLAMACPP_VERSION)"
+Write-Host "Vulkan-Headers version: $VulkanHeadersVersion (from VULKAN_HEADERS_VERSION)"
+Write-Host "Plugin dir:           $PluginDir"
+Write-Host "LlamaCpp dir:         $LlamaCppDir"
+Write-Host "Vendor source:        $VendorSrcDir"
+Write-Host "Cache dir:            $CacheDir"
 Write-Host ""
 
 #---------------------------------------------------------------------
-# 2. Resolve download URLs + target cache paths
+# 2. Idempotency: stamp + presence of every required staged file
 #---------------------------------------------------------------------
-$ReleaseBase = "https://github.com/ggml-org/llama.cpp/releases/download/$Version"
-$HeaderBase  = "https://raw.githubusercontent.com/ggml-org/llama.cpp/$Version"
+$RequiredWin64 = @("llama.dll", "ggml.dll", "ggml-base.dll", "ggml-vulkan.dll", "libomp140.x86_64.dll")
+$RequiredAndroid = @("libllama.so", "libggml.so", "libggml-base.so", "libggml-vulkan.so")
 
-$WinZipName  = "llama-$Version-bin-win-vulkan-x64.zip"
-$WinZipUrl   = "$ReleaseBase/$WinZipName"
-$WinZipPath  = Join-Path $CacheDir $WinZipName
+function Test-StagedComplete {
+    if (-not (Test-Path $StampFile)) { return $false }
+    if ((Get-Content $StampFile -Raw).Trim() -ne $Version) { return $false }
+    foreach ($f in $RequiredWin64)   { if (-not (Test-Path (Join-Path $Win64BinStageDir $f))) { return $false } }
+    foreach ($f in $RequiredAndroid) { if (-not (Test-Path (Join-Path $Arm64BinStageDir $f))) { return $false } }
+    if (-not (Test-Path (Join-Path $PublicIncDir "llama.h"))) { return $false }
 
-$AndroidTarName = "llama-$Version-bin-android-arm64.tar.gz"
-$AndroidTarUrl  = "$ReleaseBase/$AndroidTarName"
-$AndroidTarPath = Join-Path $CacheDir $AndroidTarName
+    # At least one CPU variant must be present per platform
+    $winCpuVariants = @(Get-ChildItem -Path $Win64BinStageDir -Filter "ggml-cpu-*.dll" -File -ErrorAction SilentlyContinue)
+    if ($winCpuVariants.Count -eq 0) { return $false }
+    $androidCpuVariants = @(Get-ChildItem -Path $Arm64BinStageDir -Filter "libggml-cpu-*.so" -File -ErrorAction SilentlyContinue)
+    if ($androidCpuVariants.Count -eq 0) { return $false }
+    return $true
+}
 
-#---------------------------------------------------------------------
-# 3. Idempotency: if staged binaries already match the pinned version, skip
-#---------------------------------------------------------------------
-$StampFile     = Join-Path $ThirdPartyDir ".llamacpp_version"
-$ExpectedStamp = $Version
-
-if ((Test-Path $StampFile) -and `
-    (Test-Path (Join-Path $Win64BinStageDir "llama.dll")) -and `
-    (Test-Path (Join-Path $Win64BinStageDir "ggml.dll")) -and `
-    (Test-Path (Join-Path $Win64BinStageDir "ggml-base.dll")) -and `
-    (Test-Path (Join-Path $Win64BinStageDir "ggml-vulkan.dll")) -and `
-    (Test-Path (Join-Path $Arm64BinStageDir "libllama.so")) -and `
-    (Test-Path (Join-Path $Arm64BinStageDir "libggml.so")) -and `
-    (Test-Path (Join-Path $Arm64BinStageDir "libggml-base.so")) -and `
-    (Test-Path (Join-Path $PublicIncDir "llama.h"))) {
-    $StampValue = (Get-Content $StampFile -Raw).Trim()
-    if ($StampValue -eq $ExpectedStamp) {
-        Write-Host "--- Already up to date ---" -ForegroundColor Green
-        Write-Host "  llama.cpp $Version staged."
-        Write-Host "  Delete '$StampFile' or bump LLAMACPP_VERSION to force re-stage."
-        exit 0
-    } else {
-        Write-Host "--- Version drift detected: staged=$StampValue, pinned=$ExpectedStamp. Re-staging. ---" -ForegroundColor Yellow
-    }
+if (Test-StagedComplete) {
+    Write-Host "--- Already up to date ---" -ForegroundColor Green
+    Write-Host "  llama.cpp $Version staged (Win64 + Android arm64-v8a)."
+    Write-Host "  Delete '$StampFile' or bump LLAMACPP_VERSION to force re-stage."
+    exit 0
 }
 
 #---------------------------------------------------------------------
-# 4. Preflight: create directories + helpers
+# 3. Preflight: create directories + helpers
 #---------------------------------------------------------------------
 foreach ($d in @($CacheDir, $PublicIncDir, $Win64BinStageDir, $Arm64BinStageDir)) {
     if (-not (Test-Path $d)) {
@@ -213,42 +165,34 @@ function Download-IfMissing {
     }
     Write-Host "  [DOWNLOAD] $Label"
     Write-Host "             $Url"
-    # UseBasicParsing avoids IE-engine dependency on headless / Server Core hosts.
     Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
     $sizeMb = [math]::Round((Get-Item $Dest).Length / 1MB, 1)
     Write-Host "             -> $Dest ($sizeMb MB)"
 }
 
-function Download-Header {
-    param([string]$Url, [string]$Dest, [string]$Label)
-    Write-Host "  [GET] $Label <- $Url"
-    Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
-}
+#=====================================================================
+# WIN64: download + stage upstream's prebuilt Vulkan ZIP
+#=====================================================================
+Write-Host "=== Win64 (prebuilt) ===" -ForegroundColor Cyan
 
-#---------------------------------------------------------------------
-# 5. Download binaries
-#---------------------------------------------------------------------
-Write-Host "--- Downloading release artifacts ---" -ForegroundColor Yellow
-Download-IfMissing -Url $WinZipUrl     -Dest $WinZipPath     -Label "Win64 Vulkan ZIP"    -MinSizeMb 5
-Download-IfMissing -Url $AndroidTarUrl -Dest $AndroidTarPath -Label "Android arm64 tar.gz" -MinSizeMb 1
-Write-Host ""
+$ReleaseBase    = "https://github.com/ggml-org/llama.cpp/releases/download/$Version"
+$WinZipName     = "llama-$Version-bin-win-vulkan-x64.zip"
+$WinZipPath     = Join-Path $CacheDir $WinZipName
+$WinZipUrl      = "$ReleaseBase/$WinZipName"
 
-#---------------------------------------------------------------------
-# 6. Extract + stage Win64 (Vulkan ZIP = CPU + Vulkan backends)
-#---------------------------------------------------------------------
+Write-Host "--- Downloading Win64 release artifact ---" -ForegroundColor Yellow
+Download-IfMissing -Url $WinZipUrl -Dest $WinZipPath -Label "Win64 Vulkan ZIP" -MinSizeMb 5
+
 Write-Host "--- Extracting + staging Win64 binaries ---" -ForegroundColor Yellow
-
 $WinExtractDir = Join-Path $CacheDir "win-extract-$Version"
-if (Test-Path $WinExtractDir) {
-    Remove-Item -Recurse -Force $WinExtractDir
-}
+if (Test-Path $WinExtractDir) { Remove-Item -Recurse -Force $WinExtractDir }
 New-Item -ItemType Directory -Path $WinExtractDir -Force | Out-Null
 Expand-Archive -Path $WinZipPath -DestinationPath $WinExtractDir -Force
 
-# Locate flat bin dir (may vary by release: root of ZIP vs. bin/ subdir).
+# Locate flat bin dir (root of ZIP vs. bin/ subdir varies).
 $LlamaDllCandidates = @(Get-ChildItem -Path $WinExtractDir -Filter "llama.dll" -Recurse -File)
 if ($LlamaDllCandidates.Count -eq 0) {
-    Write-Error "llama.dll not found anywhere inside $WinZipName extract. Upstream may have renamed it — inspect $WinExtractDir."
+    Write-Error "llama.dll not found anywhere inside $WinZipName extract. Upstream may have changed the layout — inspect $WinExtractDir."
 }
 $WinBinDir = $LlamaDllCandidates[0].Directory.FullName
 Write-Host "  Detected Windows bin dir: $WinBinDir"
@@ -258,9 +202,6 @@ if (Test-Path $Win64BinStageDir) {
     Get-ChildItem -Path $Win64BinStageDir -File | Remove-Item -Force
 }
 
-# Stage every library DLL (llama.dll, ggml*.dll, libomp*.dll) except
-# anything in the skip list. Runtime-critical files are verified at the
-# end of this section.
 $WinStaged = 0
 Get-ChildItem -Path $WinBinDir -File -Filter "*.dll" | ForEach-Object {
     $name = $_.Name
@@ -272,70 +213,290 @@ Get-ChildItem -Path $WinBinDir -File -Filter "*.dll" | ForEach-Object {
         Write-Host "  [SKIP]  $name (not a library DLL pattern)"
         return
     }
-    $dst = Join-Path $Win64BinStageDir $name
-    Copy-Item -Path $_.FullName -Destination $dst -Force
+    Copy-Item -Path $_.FullName -Destination (Join-Path $Win64BinStageDir $name) -Force
     $mb = [math]::Round($_.Length / 1MB, 2)
     Write-Host "  [STAGE] $name ($mb MB)"
     $WinStaged++
 }
 
-# Sanity check: the runtime-critical files must all be present.
-$WinRequired = @("llama.dll", "ggml.dll", "ggml-base.dll", "ggml-vulkan.dll", "libomp140.x86_64.dll")
-foreach ($r in $WinRequired) {
+foreach ($r in $RequiredWin64) {
     if (-not (Test-Path (Join-Path $Win64BinStageDir $r))) {
         Write-Error "Required Win64 runtime file '$r' was not staged. Upstream may have changed the archive layout."
     }
 }
-
-# At least one ggml-cpu-*.dll must exist for CPU fallback.
-$CpuVariantsStaged = @(Get-ChildItem -Path $Win64BinStageDir -Filter "ggml-cpu-*.dll" -File)
-if ($CpuVariantsStaged.Count -eq 0) {
+$WinCpuStaged = @(Get-ChildItem -Path $Win64BinStageDir -Filter "ggml-cpu-*.dll" -File)
+if ($WinCpuStaged.Count -eq 0) {
     Write-Error "No ggml-cpu-*.dll variants were staged. Upstream archive layout may have changed."
 }
-Write-Host "  Staged $WinStaged Win64 DLLs total; $($CpuVariantsStaged.Count) ggml-cpu variants."
+Write-Host "  Staged $WinStaged Win64 DLLs total; $($WinCpuStaged.Count) ggml-cpu variants."
 Write-Host ""
 
-#---------------------------------------------------------------------
-# 7. Extract + stage Android arm64 (CPU only)
-#---------------------------------------------------------------------
-Write-Host "--- Extracting + staging Android arm64 binaries ---" -ForegroundColor Yellow
+#=====================================================================
+# ANDROID: build from source (vendored submodule) with Vulkan
+#=====================================================================
+Write-Host "=== Android arm64-v8a (from source) ===" -ForegroundColor Cyan
 
-$AndroidExtractDir = Join-Path $CacheDir "android-extract-$Version"
-if (Test-Path $AndroidExtractDir) {
-    Remove-Item -Recurse -Force $AndroidExtractDir
+# 1. Verify vendor submodule is checked out at the matching tag.
+if (-not (Test-Path (Join-Path $VendorSrcDir "CMakeLists.txt"))) {
+    Write-Error @"
+Vendor submodule not initialized at $VendorSrcDir.
+Run from the InoLlama plugin repo:
+  git submodule update --init --recursive
+"@
 }
-New-Item -ItemType Directory -Path $AndroidExtractDir -Force | Out-Null
 
-# Use the Windows-native bsdtar (System32\tar.exe) explicitly. A bare
-# "tar" call would pick up MSYS/Git-Bash tar if the script is invoked
-# from a Git-Bash-derived shell, and MSYS tar mis-parses Windows paths
-# like "E:\..." as "host E, path \..." (SSH-style), causing
-# "Cannot connect to E: resolve failed". Windows 10 1803+ guarantees
-# System32\tar.exe is present.
-$WinTarExe = Join-Path $env:SystemRoot "System32\tar.exe"
-if (-not (Test-Path $WinTarExe)) {
-    Write-Error "Expected Windows tar.exe at $WinTarExe — Windows 10 1803+ is required."
+Write-Host "--- Verifying vendor submodule tag ---" -ForegroundColor Yellow
+$VendorTag = ""
+try {
+    Push-Location $VendorSrcDir
+    $VendorTag = (& git describe --tags --exact-match HEAD 2>$null).Trim()
+} finally {
+    Pop-Location
 }
-& $WinTarExe -xzf $AndroidTarPath -C $AndroidExtractDir
+if ($VendorTag -ne $Version) {
+    Write-Error @"
+Vendor submodule is checked out at '$VendorTag', but LLAMACPP_VERSION is '$Version'.
+They MUST match. To sync:
+  git -C "$VendorSrcDir" fetch --tags
+  git -C "$VendorSrcDir" checkout $Version
+"@
+}
+Write-Host "  Submodule tag: $VendorTag (matches LLAMACPP_VERSION)"
+
+# 2. Detect Android SDK + NDK
+Write-Host "--- Detecting Android SDK + NDK ---" -ForegroundColor Yellow
+$SdkRoot = ""
+foreach ($candidate in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, (Join-Path $env:LOCALAPPDATA "Android\Sdk"))) {
+    if ($candidate -and (Test-Path $candidate)) {
+        $SdkRoot = $candidate
+        break
+    }
+}
+if (-not $SdkRoot) {
+    Write-Error "Android SDK root not found. Set ANDROID_HOME, ANDROID_SDK_ROOT, or install Android Studio (default: %LOCALAPPDATA%\Android\Sdk)."
+}
+Write-Host "  Android SDK:    $SdkRoot"
+
+$NdkVersion = "28.2.13676358"
+$NdkRoot    = Join-Path $SdkRoot "ndk\$NdkVersion"
+if (-not (Test-Path $NdkRoot)) {
+    Write-Error @"
+NDK $NdkVersion not found at $NdkRoot.
+Install via Android Studio SDK Manager:
+  Tools > SDK Manager > SDK Tools > NDK (Side by side) > pin version $NdkVersion
+"@
+}
+Write-Host "  Android NDK:    $NdkRoot (r28b)"
+
+$ToolchainFile  = Join-Path $NdkRoot "build\cmake\android.toolchain.cmake"
+$Glslc          = Join-Path $NdkRoot "shader-tools\windows-x86_64\glslc.exe"
+$NdkClang       = Join-Path $NdkRoot "toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe"
+foreach ($p in @($ToolchainFile, $Glslc, $NdkClang)) {
+    if (-not (Test-Path $p)) {
+        Write-Error "Required NDK component missing: $p"
+    }
+}
+Write-Host "  Toolchain file: $ToolchainFile"
+Write-Host "  glslc (shaders): $Glslc"
+
+# 3. Detect SDK-bundled ninja (system ninja is rarely installed)
+$SdkCMakeDir = Join-Path $SdkRoot "cmake\3.22.1\bin"
+$Ninja       = Join-Path $SdkCMakeDir "ninja.exe"
+if (-not (Test-Path $Ninja)) {
+    # Fall back to PATH lookup
+    $NinjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
+    if ($NinjaCmd) {
+        $Ninja = $NinjaCmd.Source
+    } else {
+        Write-Error @"
+ninja.exe not found at $Ninja and not on PATH.
+Install via Android Studio SDK Manager: Tools > SDK Manager > SDK Tools > CMake.
+"@
+    }
+}
+Write-Host "  ninja:          $Ninja"
+
+# Use system cmake if available (newer), else SDK cmake.
+$CMake = (Get-Command cmake -ErrorAction SilentlyContinue).Source
+if (-not $CMake) {
+    $CMake = Join-Path $SdkCMakeDir "cmake.exe"
+}
+if (-not (Test-Path $CMake)) {
+    Write-Error "cmake not found on PATH or in $SdkCMakeDir"
+}
+Write-Host "  cmake:          $CMake"
+
+# 4. Detect Visual Studio + import vcvars64.bat env so cl.exe is on PATH for
+#    the host-side vulkan-shaders-gen ExternalProject build.
+Write-Host "--- Setting up host MSVC env (for vulkan-shaders-gen) ---" -ForegroundColor Yellow
+$VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $VsWhere)) {
+    Write-Error "vswhere.exe not found at $VsWhere. Install Visual Studio 2022 (any edition) — required by UE 5.7."
+}
+$VsInstallPath = (& $VsWhere -latest -property installationPath 2>$null).Trim()
+if (-not $VsInstallPath -or -not (Test-Path $VsInstallPath)) {
+    Write-Error "Visual Studio install not located via vswhere. UE 5.7 requires VS 2022."
+}
+$VcVarsBat = Join-Path $VsInstallPath "VC\Auxiliary\Build\vcvars64.bat"
+if (-not (Test-Path $VcVarsBat)) {
+    Write-Error "vcvars64.bat not found at $VcVarsBat — VS install may be incomplete (missing C++ workload)."
+}
+Write-Host "  VS install:     $VsInstallPath"
+
+# Import vcvars64 env into this PowerShell session so child cmake invocations
+# find cl/link via PATH for the host shader-gen subbuild.
+$VcVarsLines = & cmd /c "`"$VcVarsBat`" > nul 2>&1 && set"
+foreach ($line in $VcVarsLines) {
+    if ($line -match '^([^=]+)=(.*)$') {
+        Set-Item -Path "Env:$($matches[1])" -Value $matches[2]
+    }
+}
+$ClPath = (Get-Command cl -ErrorAction SilentlyContinue).Source
+if (-not $ClPath) {
+    Write-Error "cl.exe not on PATH after sourcing $VcVarsBat. VS C++ workload may not be installed."
+}
+Write-Host "  cl.exe:         $ClPath"
+
+# 5. Stage Vulkan headers — both KhronosGroup/Vulkan-Headers (provides
+#    <vulkan/vulkan.hpp>, the C++ binding) AND KhronosGroup/SPIRV-Headers
+#    (provides <spirv/unified1/spirv.hpp>) into a unified include dir.
+#    Android NDK ships <vulkan/vulkan_core.h> only; everything else
+#    ggml-vulkan.cpp uses comes from these two Khronos repos.
+#    Both are pinned to the same vulkan-sdk-* tag so versions stay in
+#    lockstep with what a LunarG Vulkan SDK installation would provide.
+Write-Host "--- Staging Vulkan + SPIRV headers ($VulkanHeadersVersion) ---" -ForegroundColor Yellow
+
+$VulkanIncludeDir = Join-Path $CacheDir "vulkan-include-$VulkanHeadersVersion"
+$VulkanHppMarker  = Join-Path $VulkanIncludeDir "vulkan\vulkan.hpp"
+$SpirvHppMarker   = Join-Path $VulkanIncludeDir "spirv\unified1\spirv.hpp"
+
+# Use Windows-native bsdtar (System32\tar.exe) — explicit to avoid
+# Git-Bash MSYS tar mis-parsing Windows paths like "E:\..." as SSH host:path.
+$WinTarExe2 = Join-Path $env:SystemRoot "System32\tar.exe"
+if (-not (Test-Path $WinTarExe2)) {
+    Write-Error "Expected Windows tar.exe at $WinTarExe2 — Windows 10 1803+ required."
+}
+
+if (-not ((Test-Path $VulkanHppMarker) -and (Test-Path $SpirvHppMarker))) {
+    if (Test-Path $VulkanIncludeDir) {
+        Remove-Item -Recurse -Force $VulkanIncludeDir
+    }
+    New-Item -ItemType Directory -Path $VulkanIncludeDir -Force | Out-Null
+
+    # Download both tarballs (cached if already in $CacheDir).
+    $VulkanHeadersTarPath = Join-Path $CacheDir "Vulkan-Headers-$VulkanHeadersVersion.tar.gz"
+    $SpirvHeadersTarPath  = Join-Path $CacheDir "SPIRV-Headers-$VulkanHeadersVersion.tar.gz"
+    Download-IfMissing `
+        -Url "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/$VulkanHeadersVersion.tar.gz" `
+        -Dest $VulkanHeadersTarPath -Label "Vulkan-Headers" -MinSizeMb 1
+    Download-IfMissing `
+        -Url "https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/$VulkanHeadersVersion.tar.gz" `
+        -Dest $SpirvHeadersTarPath  -Label "SPIRV-Headers"  -MinSizeMb 1
+
+    # Extract both into a scratch dir, then copy `include/*` from each
+    # into our unified include dir.
+    $ScratchExtract = Join-Path $CacheDir "vulkan-extract-$VulkanHeadersVersion"
+    if (Test-Path $ScratchExtract) { Remove-Item -Recurse -Force $ScratchExtract }
+    New-Item -ItemType Directory -Path $ScratchExtract -Force | Out-Null
+
+    & $WinTarExe2 -xzf $VulkanHeadersTarPath -C $ScratchExtract
+    if ($LASTEXITCODE -ne 0) { Write-Error "Vulkan-Headers extraction failed (exit $LASTEXITCODE)." }
+    & $WinTarExe2 -xzf $SpirvHeadersTarPath  -C $ScratchExtract
+    if ($LASTEXITCODE -ne 0) { Write-Error "SPIRV-Headers extraction failed (exit $LASTEXITCODE)." }
+
+    $VulkanIncSrc = Join-Path $ScratchExtract "Vulkan-Headers-$VulkanHeadersVersion\include"
+    $SpirvIncSrc  = Join-Path $ScratchExtract "SPIRV-Headers-$VulkanHeadersVersion\include"
+    if (-not (Test-Path $VulkanIncSrc)) { Write-Error "Vulkan-Headers archive missing 'include/' at $VulkanIncSrc" }
+    if (-not (Test-Path $SpirvIncSrc))  { Write-Error "SPIRV-Headers archive missing 'include/' at $SpirvIncSrc" }
+
+    Copy-Item -Path (Join-Path $VulkanIncSrc "*") -Destination $VulkanIncludeDir -Recurse -Force
+    Copy-Item -Path (Join-Path $SpirvIncSrc  "*") -Destination $VulkanIncludeDir -Recurse -Force
+
+    Remove-Item -Recurse -Force $ScratchExtract
+}
+
+if (-not (Test-Path $VulkanHppMarker)) { Write-Error "vulkan.hpp not staged at $VulkanHppMarker" }
+if (-not (Test-Path $SpirvHppMarker))  { Write-Error "spirv/unified1/spirv.hpp not staged at $SpirvHppMarker" }
+Write-Host "  Unified include:  $VulkanIncludeDir"
+Write-Host "    vulkan/vulkan.hpp + spirv/unified1/spirv.hpp present."
+
+# 6. Configure + build
+# API 30 (Android 11) — matches the hosting game's minSdk. ggml-vulkan
+# requires API >= 28 anyway because it calls Vulkan 1.1 symbols like
+# vkGetPhysicalDeviceFeatures2 which the NDK's libvulkan.so stub only
+# exposes from API 28 onward (API 26's stub is Vulkan 1.0 only).
+$AndroidPlatform = "android-30"
+$BuildDir        = Join-Path $CacheDir "android-build-$Version"
+$InstallDir      = Join-Path $CacheDir "android-install-$Version"
+
+Write-Host "--- Configuring CMake (cross-compile arm64-v8a + Vulkan) ---" -ForegroundColor Yellow
+Write-Host "  Build dir:      $BuildDir"
+Write-Host "  Install dir:    $InstallDir"
+Write-Host "  ANDROID_PLATFORM: $AndroidPlatform"
+
+if (-not (Test-Path $BuildDir)) {
+    New-Item -ItemType Directory -Path $BuildDir -Force | Out-Null
+}
+
+$ConfigureArgs = @(
+    "-S", $VendorSrcDir,
+    "-B", $BuildDir,
+    "-G", "Ninja",
+    "-DCMAKE_MAKE_PROGRAM=$Ninja",
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DCMAKE_TOOLCHAIN_FILE=$ToolchainFile",
+    "-DANDROID_ABI=arm64-v8a",
+    "-DANDROID_PLATFORM=$AndroidPlatform",
+    "-DCMAKE_INSTALL_PREFIX=$InstallDir",
+    # ggml backend toggles
+    "-DGGML_NATIVE=OFF",
+    "-DGGML_BACKEND_DL=ON",
+    "-DGGML_CPU_ALL_VARIANTS=ON",
+    "-DGGML_OPENMP=OFF",
+    "-DGGML_LLAMAFILE=OFF",
+    "-DGGML_VULKAN=ON",
+    "-DVulkan_GLSLC_EXECUTABLE=$Glslc",
+    "-DVulkan_INCLUDE_DIR=$VulkanIncludeDir",
+    # llama.cpp toggles — minimal build, no CLI/server/tests/examples
+    "-DLLAMA_BUILD_TESTS=OFF",
+    "-DLLAMA_BUILD_EXAMPLES=OFF",
+    "-DLLAMA_BUILD_TOOLS=OFF",
+    "-DLLAMA_BUILD_SERVER=OFF",
+    "-DLLAMA_OPENSSL=OFF",
+    "-DLLAMA_CURL=OFF",
+    "-DGGML_BUILD_TESTS=OFF",
+    "-DGGML_BUILD_EXAMPLES=OFF"
+)
+
+& $CMake @ConfigureArgs
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "tar extraction of $AndroidTarPath failed (exit $LASTEXITCODE)."
+    Write-Error "CMake configure failed (exit $LASTEXITCODE). See output above."
 }
 
-# Locate libllama.so and use its directory as the source dir.
-$LibLlamaCandidates = @(Get-ChildItem -Path $AndroidExtractDir -Filter "libllama.so" -Recurse -File)
-if ($LibLlamaCandidates.Count -eq 0) {
-    Write-Error "libllama.so not found anywhere inside $AndroidTarName extract. Upstream may have renamed it."
+Write-Host ""
+Write-Host "--- Building (this takes 5-15 min on first run) ---" -ForegroundColor Yellow
+& $CMake --build $BuildDir --config Release
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "CMake build failed (exit $LASTEXITCODE). See output above."
 }
-$AndroidLibDir = $LibLlamaCandidates[0].Directory.FullName
-Write-Host "  Detected Android lib dir: $AndroidLibDir"
 
-# Wipe previously-staged .so files.
+# 7. Stage outputs to Source/ThirdParty/Android/arm64-v8a/
+Write-Host ""
+Write-Host "--- Staging Android binaries ---" -ForegroundColor Yellow
+
+# llama.cpp puts shared libs in <build>/bin/ via CMAKE_LIBRARY_OUTPUT_DIRECTORY.
+$BuildBinDir = Join-Path $BuildDir "bin"
+if (-not (Test-Path $BuildBinDir)) {
+    Write-Error "Expected build output dir not found: $BuildBinDir. Inspect $BuildDir."
+}
+
+# Wipe previously-staged .so files so removed-upstream files don't linger.
 if (Test-Path $Arm64BinStageDir) {
     Get-ChildItem -Path $Arm64BinStageDir -File | Remove-Item -Force
 }
 
 $AndroidStaged = 0
-Get-ChildItem -Path $AndroidLibDir -File -Filter "*.so" | ForEach-Object {
+Get-ChildItem -Path $BuildBinDir -File -Filter "*.so" | ForEach-Object {
     $name = $_.Name
     if ($AndroidSkipList -contains $name) {
         Write-Host "  [SKIP]  $name (explicit skip list)"
@@ -345,60 +506,61 @@ Get-ChildItem -Path $AndroidLibDir -File -Filter "*.so" | ForEach-Object {
         Write-Host "  [SKIP]  $name (not a library .so pattern)"
         return
     }
-    $dst = Join-Path $Arm64BinStageDir $name
-    Copy-Item -Path $_.FullName -Destination $dst -Force
+    Copy-Item -Path $_.FullName -Destination (Join-Path $Arm64BinStageDir $name) -Force
     $mb = [math]::Round($_.Length / 1MB, 2)
     Write-Host "  [STAGE] $name ($mb MB)"
     $AndroidStaged++
 }
 
-# Sanity check runtime-critical Android files.
-$AndroidRequired = @("libllama.so", "libggml.so", "libggml-base.so")
-foreach ($r in $AndroidRequired) {
+foreach ($r in $RequiredAndroid) {
     if (-not (Test-Path (Join-Path $Arm64BinStageDir $r))) {
-        Write-Error "Required Android runtime file '$r' was not staged. Upstream archive layout may have changed."
+        Write-Error "Required Android runtime file '$r' was not built/staged. Inspect $BuildBinDir for the actual output."
     }
 }
-$CpuVariantsStagedAndroid = @(Get-ChildItem -Path $Arm64BinStageDir -Filter "libggml-cpu-*.so" -File)
-if ($CpuVariantsStagedAndroid.Count -eq 0) {
-    Write-Error "No libggml-cpu-*.so variants were staged on Android. Upstream archive layout may have changed."
+$AndroidCpuStaged = @(Get-ChildItem -Path $Arm64BinStageDir -Filter "libggml-cpu-*.so" -File)
+if ($AndroidCpuStaged.Count -eq 0) {
+    Write-Error "No libggml-cpu-*.so variants were built. Check that GGML_CPU_ALL_VARIANTS=ON took effect."
 }
-Write-Host "  Staged $AndroidStaged Android .so files total; $($CpuVariantsStagedAndroid.Count) libggml-cpu variants."
+Write-Host "  Staged $AndroidStaged Android .so files total; $($AndroidCpuStaged.Count) libggml-cpu variants."
 Write-Host ""
 
-#---------------------------------------------------------------------
-# 8. Fetch public headers from raw.githubusercontent.com at the pinned tag
-#---------------------------------------------------------------------
-# Headers aren't bundled in the release archives — fetch them from the
-# git tag's raw view. Six small files; single-source-of-truth is the
-# tag we already pinned for binaries.
-Write-Host "--- Fetching public C API headers ---" -ForegroundColor Yellow
+#=====================================================================
+# 7. Public headers from raw.githubusercontent.com at the pinned tag
+#=====================================================================
+# Headers aren't bundled in the Windows release ZIP. Use the vendor submodule
+# for headers when possible (already on disk at the correct tag), with
+# raw.githubusercontent.com as a fallback.
+Write-Host "=== Public C API headers ===" -ForegroundColor Cyan
+Write-Host "--- Staging from vendor submodule ---" -ForegroundColor Yellow
 
-# Wipe previously-staged headers so removed files don't linger.
 if (Test-Path $PublicIncDir) {
     Get-ChildItem -Path $PublicIncDir -File | Remove-Item -Force
 }
 
 foreach ($name in $Headers.Keys) {
     $repoPath = $Headers[$name]
-    $url = "$HeaderBase/$repoPath"
+    $src = Join-Path $VendorSrcDir $repoPath
     $dst = Join-Path $PublicIncDir $name
-    Download-Header -Url $url -Dest $dst -Label $name
+    if (-not (Test-Path $src)) {
+        Write-Error "Header '$repoPath' missing in vendor submodule at $src. Submodule may not be fully checked out."
+    }
+    Copy-Item -Path $src -Destination $dst -Force
+    Write-Host "  [STAGE] $name <- $repoPath"
 }
 
-# Verify all expected headers landed.
+# Sanity check
 foreach ($name in $Headers.Keys) {
     $dst = Join-Path $PublicIncDir $name
     if (-not (Test-Path $dst) -or (Get-Item $dst).Length -lt 100) {
-        Write-Error "Header '$name' did not download correctly (missing or truncated at $dst)."
+        Write-Error "Header '$name' did not stage correctly (missing or truncated at $dst)."
     }
 }
 Write-Host ""
 
-#---------------------------------------------------------------------
-# 9. Write version stamp
-#---------------------------------------------------------------------
-Set-Content -Path $StampFile -Value $ExpectedStamp -NoNewline -Encoding ASCII
+#=====================================================================
+# 8. Write version stamp
+#=====================================================================
+Set-Content -Path $StampFile -Value $Version -NoNewline -Encoding ASCII
 
 Write-Host "=== llama.cpp $Version staged successfully ===" -ForegroundColor Green
 Write-Host ""
@@ -423,6 +585,3 @@ Get-ChildItem -Path $PublicIncDir -File | Sort-Object Name | ForEach-Object {
     Write-Host "  - $($_.Name)"
 }
 Write-Host ""
-Write-Host "Next steps:"
-Write-Host "  1. Milestone B: add Source/ThirdParty/InoLlamaCpp/InoLlamaCpp.Build.cs + UPL XML."
-Write-Host "  2. Milestone C: InoLlamaCppModule::Init loads llama.dll by full path; ggml_backend_load_all auto-discovers ggml-*.dll backends."

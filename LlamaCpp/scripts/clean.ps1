@@ -1,8 +1,11 @@
 # clean.ps1
 #
-# Wipes the download cache, staged headers, and staged binaries for the
-# llama.cpp integration. Safe to run anytime — re-run setup-llamacpp.ps1
-# afterwards to restore everything.
+# Wipes the download cache, build cache, staged headers, and staged
+# binaries for the llama.cpp integration. Safe to run anytime — re-run
+# setup-llamacpp.ps1 afterwards to restore everything.
+#
+# Does NOT touch the LlamaCpp/vendor/llama.cpp/ submodule (that's source,
+# not generated). Use git submodule commands to manage the submodule.
 
 $ErrorActionPreference = "Stop"
 
@@ -29,4 +32,5 @@ foreach ($t in $Targets) {
 }
 
 Write-Host ""
+Write-Host "Note: vendor/llama.cpp submodule is NOT touched (source, not generated)." -ForegroundColor DarkGray
 Write-Host "Clean complete. Run setup-llamacpp.ps1 to restage." -ForegroundColor Green

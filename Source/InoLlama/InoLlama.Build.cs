@@ -59,16 +59,24 @@ public class InoLlama : ModuleRules
 		// This is the only UE module in the plugin, so it owns the third-party
 		// wiring directly (no separate external module). Build artifacts are
 		// produced by Plugins/InoLlama/LlamaCpp/scripts/setup-llamacpp.ps1
-		// which downloads upstream's prebuilt release artifacts and stages
-		// them into the consolidated tree:
+		// which uses a hybrid strategy: prebuilt download for Win64, from-source
+		// build (vendored submodule) for Android. Outputs are staged into the
+		// consolidated tree:
 		//
 		//     Source/ThirdParty/Public/                       llama.cpp C API headers
 		//     Source/ThirdParty/Win64/                        19 DLLs (llama + ggml +
 		//                                                     14 CPU variants + Vulkan +
 		//                                                     OpenMP redist)
-		//     Source/ThirdParty/Android/arm64-v8a/            10 .so files (libllama +
+		//     Source/ThirdParty/Android/arm64-v8a/            11 .so files (libllama +
 		//                                                     libggml + 7 ARM tier
-		//                                                     CPU variants)
+		//                                                     CPU variants + Vulkan)
+		//
+		// Win64 staging comes from upstream's `llama-<tag>-bin-win-vulkan-x64.zip`.
+		// Android staging is built from the LlamaCpp/vendor/llama.cpp/ submodule
+		// at the same pinned tag, with -DGGML_VULKAN=ON, because upstream's
+		// `llama-<tag>-bin-android-arm64.tar.gz` release is CPU-only and they
+		// do not publish Android Vulkan prebuilts. See LlamaCpp/scripts/
+		// setup-llamacpp.ps1 for the build flags.
 		//
 		// Companion file in this same module directory:
 		//     InoLlama_UPL_Android.xml             Android packaging directives
@@ -102,7 +110,10 @@ public class InoLlama : ModuleRules
 		//   part of the Vulkan runtime loader bundled with Windows 10 1803+
 		//   and every modern GPU driver (NVIDIA, AMD, Intel). Not redistributed
 		//   by us — Windows provides it. Same story on Android: libvulkan.so
-		//   is part of the platform from API 24+. We target API 26+.
+		//   is part of the platform from API 24+. We target API 30+
+		//   (matches the hosting game's minSdk). ggml-vulkan also
+		//   needs Vulkan 1.1 symbols like vkGetPhysicalDeviceFeatures2,
+		//   exposed by the NDK libvulkan.so stub from API 28 onward.
 
 		string ThirdPartyDir  = Path.Combine(PluginDirectory, "Source", "ThirdParty");
 		string PublicDir      = Path.Combine(ThirdPartyDir, "Public");
@@ -187,9 +198,10 @@ public class InoLlama : ModuleRules
 			// Required files — every shipment.
 			string[] RequiredAndroid = new string[]
 			{
-				"libllama.so",     // main library
-				"libggml.so",      // dispatcher
-				"libggml-base.so", // base implementation
+				"libllama.so",        // main library
+				"libggml.so",         // dispatcher
+				"libggml-base.so",    // base implementation
+				"libggml-vulkan.so",  // Vulkan GPU backend (built from source)
 			};
 			foreach (string name in RequiredAndroid)
 			{

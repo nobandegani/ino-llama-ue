@@ -119,6 +119,15 @@ Docs: https://docs.unrealengine.com/en-US/Sharing/Reference/UnrealPluginLanguage
                     src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-base.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-base.so"/>
 
+                <!-- Vulkan GPU backend (built from source — upstream
+                     does not publish Android Vulkan prebuilts). Loaded
+                     at runtime by libggml.so's backend auto-discovery
+                     glob (ggml_backend_load_all matches libggml-*.so),
+                     so no soLoadLibrary preload needed. -->
+                <copyFile
+                    src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-vulkan.so"
+                    dst="$S(BuildDir)/libs/$S(Architecture)/libggml-vulkan.so"/>
+
                 <!-- CPU variants (ARM tier — runtime picker chooses). -->
                 <copyFile
                     src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv8.0_1.so"
@@ -142,7 +151,7 @@ Docs: https://docs.unrealengine.com/en-US/Sharing/Reference/UnrealPluginLanguage
                     src="$S(AbsPluginDir)/../ThirdParty/Android/$S(Architecture)/libggml-cpu-android_armv9.2_2.so"
                     dst="$S(BuildDir)/libs/$S(Architecture)/libggml-cpu-android_armv9.2_2.so"/>
 
-                <log text="InoLlama: copied 10 .so files to lib/$S(Architecture)/"/>
+                <log text="InoLlama: copied 11 .so files to lib/$S(Architecture)/"/>
             </true>
         </if>
     </resourceCopies>
