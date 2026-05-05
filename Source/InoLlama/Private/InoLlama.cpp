@@ -336,6 +336,12 @@ namespace
         // Memory (KV-cache)
         INO_RESOLVE_LLAMA(llama_get_memory);
         INO_RESOLVE_LLAMA(llama_memory_clear);
+        INO_RESOLVE_LLAMA(llama_memory_seq_rm);
+
+        // State / sequence cache (KV snapshot + restore)
+        INO_RESOLVE_LLAMA(llama_state_seq_get_size);
+        INO_RESOLVE_LLAMA(llama_state_seq_get_data);
+        INO_RESOLVE_LLAMA(llama_state_seq_set_data);
 
         // Vocab
         INO_RESOLVE_LLAMA(llama_vocab_n_tokens);

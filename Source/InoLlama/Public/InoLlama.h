@@ -170,6 +170,49 @@ namespace InoAgents::LlamaCpp
         llama_memory_t (*llama_get_memory)(const struct llama_context* ctx) = nullptr;
         void           (*llama_memory_clear)(llama_memory_t mem, bool data) = nullptr;
 
+        // Per-sequence KV trimming. Removes tokens [p0, p1) from seq_id
+        // (with -1 meaning "any sequence", p0<0 meaning "from 0", p1<0
+        // meaning "to infinity"). Used by KV-snapshot consumers to clear
+        // post-snapshot tokens before restoring state across iterations.
+        // Returns false if a partial sequence cannot be removed.
+        bool           (*llama_memory_seq_rm)(
+                           llama_memory_t mem,
+                           llama_seq_id   seq_id,
+                           llama_pos      p0,
+                           llama_pos      p1) = nullptr;
+
+        // --- State / sequence cache (snapshot + restore for KV reuse) ---
+        // Used by NeuTTS voice caching: the fixed voice prefix is
+        // prefilled once into seq 0, snapshotted via _get_data, and
+        // restored via _set_data at the start of every synth so the
+        // ~50–100 prefix tokens don't re-prefill per call. Equivalent
+        // pattern works for any "fixed long prefix + variable suffix"
+        // GGUF consumer.
+
+        // Returns the exact byte size needed to copy the state of a
+        // single sequence (call before allocating the buffer; the size
+        // is generally O(KV_size_per_token * n_tokens_in_seq)).
+        size_t (*llama_state_seq_get_size)(
+                   struct llama_context* ctx,
+                   llama_seq_id          seq_id) = nullptr;
+
+        // Copy a sequence's state into the caller-provided buffer.
+        // Returns the number of bytes written (0 on failure).
+        size_t (*llama_state_seq_get_data)(
+                   struct llama_context* ctx,
+                   uint8_t*              dst,
+                   size_t                size,
+                   llama_seq_id          seq_id) = nullptr;
+
+        // Load sequence state previously saved with _get_data into the
+        // specified destination sequence. Returns the number of bytes
+        // read (0 on failure).
+        size_t (*llama_state_seq_set_data)(
+                   struct llama_context* ctx,
+                   const uint8_t*        src,
+                   size_t                size,
+                   llama_seq_id          dest_seq_id) = nullptr;
+
         // --- Vocab queries ---
         int32_t      (*llama_vocab_n_tokens)(const struct llama_vocab* vocab) = nullptr;
         llama_token  (*llama_vocab_eos)(const struct llama_vocab* vocab) = nullptr;
