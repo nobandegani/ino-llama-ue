@@ -158,6 +158,24 @@ namespace InoAgents::LlamaCpp
                                       char* buf, size_t buf_size) = nullptr;
         int32_t                   (*llama_model_n_ctx_train)(const struct llama_model* model) = nullptr;
 
+        // --- Model diagnostics (size, layer count, param count) ---
+        // Used for the runner's "model loaded" log so callers can verify
+        // the variant they think loaded actually loaded. n_params returns
+        // the raw parameter count (typically millions / billions);
+        // model_size is the resident byte size of the model's tensors
+        // (mmap'd or copied). n_layer is needed to compute "did we
+        // offload N out of M layers".
+        uint64_t (*llama_model_size)    (const struct llama_model* model) = nullptr;
+        uint64_t (*llama_model_n_params)(const struct llama_model* model) = nullptr;
+        int32_t  (*llama_model_n_layer) (const struct llama_model* model) = nullptr;
+
+        // --- Build-level capability check ---
+        // Returns true iff this build of llama.cpp was compiled with at
+        // least one GPU backend (Vulkan / CUDA / Metal / etc.). Used by
+        // diagnostic logs to flag silent CPU fallback when NumGpuLayers
+        // > 0 was requested but no GPU backend is available.
+        bool (*llama_supports_gpu_offload)(void) = nullptr;
+
         // --- Context lifecycle ---
         struct llama_context_params (*llama_context_default_params)(void) = nullptr;
         struct llama_context*       (*llama_init_from_model)(
@@ -165,6 +183,14 @@ namespace InoAgents::LlamaCpp
                                         struct llama_context_params params) = nullptr;
         void                        (*llama_free)(struct llama_context* ctx) = nullptr;
         uint32_t                    (*llama_n_ctx)(const struct llama_context* ctx) = nullptr;
+
+        // --- Context diagnostics (effective thread counts) ---
+        // After llama_init_from_model some context params are normalized
+        // (e.g. n_threads<=0 turns into hardware_concurrency); these
+        // getters return the EFFECTIVE values the context is using, which
+        // is what diagnostic logs should report.
+        int32_t (*llama_n_threads)      (struct llama_context* ctx) = nullptr;
+        int32_t (*llama_n_threads_batch)(struct llama_context* ctx) = nullptr;
 
         // --- Memory / KV-cache reset (separate memory handle in modern llama.cpp) ---
         llama_memory_t (*llama_get_memory)(const struct llama_context* ctx) = nullptr;

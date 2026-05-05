@@ -327,11 +327,23 @@ namespace
         INO_RESOLVE_LLAMA(llama_model_desc);
         INO_RESOLVE_LLAMA(llama_model_n_ctx_train);
 
+        // Model diagnostics
+        INO_RESOLVE_LLAMA(llama_model_size);
+        INO_RESOLVE_LLAMA(llama_model_n_params);
+        INO_RESOLVE_LLAMA(llama_model_n_layer);
+
+        // Build-level capability check
+        INO_RESOLVE_LLAMA(llama_supports_gpu_offload);
+
         // Context
         INO_RESOLVE_LLAMA(llama_context_default_params);
         INO_RESOLVE_LLAMA(llama_init_from_model);
         INO_RESOLVE_LLAMA(llama_free);
         INO_RESOLVE_LLAMA(llama_n_ctx);
+
+        // Context diagnostics
+        INO_RESOLVE_LLAMA(llama_n_threads);
+        INO_RESOLVE_LLAMA(llama_n_threads_batch);
 
         // Memory (KV-cache)
         INO_RESOLVE_LLAMA(llama_get_memory);
