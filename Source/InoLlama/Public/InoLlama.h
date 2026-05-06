@@ -133,6 +133,19 @@ namespace InoAgents::LlamaCpp
         // ggml-vulkan (or the 7 Android ARM variants).
         void        (*ggml_backend_load_all_from_path)(const char* dir_path) = nullptr;
 
+        // Single-backend loader: dlopens one .so/.dll, looks up
+        // ggml_backend_score (filtering unsupported variants on the host
+        // CPU) and ggml_backend_init, registers the result. Returns nullptr
+        // if the file isn't a backend, the score is zero, or the API
+        // version is wrong. Used on Android where ggml_backend_load_all_from_path
+        // can't enumerate the APK's lib/<arch>/ dir (extractNativeLibs=false
+        // makes the .so files virtual — `opendir` fails — but `dlopen`
+        // by bare soname still works because Android's linker namespace
+        // covers them). We call this for each backend .so we know we
+        // shipped, with the bare soname, so the linker resolves through
+        // the standard search path.
+        struct ggml_backend_reg* (*ggml_backend_load)(const char* path) = nullptr;
+
         // Backend enumeration — used by smoke tests to log which
         // backends actually registered successfully on the host CPU / GPU.
         size_t                   (*ggml_backend_reg_count)(void) = nullptr;

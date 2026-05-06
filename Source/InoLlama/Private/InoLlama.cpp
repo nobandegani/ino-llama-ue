@@ -315,6 +315,7 @@ namespace
         INO_RESOLVE_LLAMA(llama_backend_free);
         INO_RESOLVE_LLAMA(llama_print_system_info);
         INO_RESOLVE_LLAMA(ggml_backend_load_all_from_path);
+        INO_RESOLVE_LLAMA(ggml_backend_load);
         INO_RESOLVE_LLAMA(ggml_backend_reg_count);
         INO_RESOLVE_LLAMA(ggml_backend_reg_get);
         INO_RESOLVE_LLAMA(ggml_backend_reg_name);
@@ -472,21 +473,97 @@ bool Init()
            ResolvedCount, TotalCount);
 
     // Register all backends.
+#if PLATFORM_WINDOWS
     if (GApi.ggml_backend_load_all_from_path != nullptr)
     {
-#if PLATFORM_WINDOWS
         const FTCHARToUTF8 BinDirUtf8(*BinDir);
         GApi.ggml_backend_load_all_from_path(BinDirUtf8.Get());
         UE_LOG(LogInoLlama, Log,
                TEXT("LlamaCpp: Module: ggml_backend_load_all_from_path(%s) invoked."),
                *BinDir);
-#else
-        // Android: pass nullptr so upstream falls back to its default.
-        GApi.ggml_backend_load_all_from_path(nullptr);
-        UE_LOG(LogInoLlama, Log,
-               TEXT("LlamaCpp: Module: ggml_backend_load_all_from_path(nullptr) invoked (Android default search)."));
-#endif
     }
+#elif PLATFORM_ANDROID
+    // Android: ggml_backend_load_all_from_path can't enumerate the APK's
+    // lib/<arch>/ dir on a modern build (extractNativeLibs=false leaves the
+    // .so files inside the APK as virtual entries; opendir on the
+    // executable's parent dir returns a path like /data/app/.../base.apk
+    // that has no readable directory contents).
+    //
+    // Workaround: dlopen each backend .so by bare soname. Android's linker
+    // namespace covers the APK's lib/<arch>/ even when it isn't a
+    // filesystem-visible dir, so dlopen("libfoo.so") resolves correctly.
+    // ggml_backend_load() does exactly that and runs the backend's score
+    // probe (rejecting CPU variants whose required ARM ISA isn't on the
+    // host) before registering, so calling it for every variant we ship
+    // is safe — the unsupported ones self-reject with a benign Info log.
+    //
+    // Set must match LlamaCpp/scripts/setup-llamacpp.ps1's Android stage
+    // step + InoLlama_UPL_Android.xml's <copyFile> list. If a future
+    // llama.cpp release adds or removes ARM tier variants, update both.
+    if (GApi.ggml_backend_load != nullptr)
+    {
+        static const char* const AndroidBackendSonames[] = {
+            // GPU first — if Vulkan supports the device, it scores higher
+            // than every CPU variant and the runtime backend picker
+            // prefers it.
+            "libggml-vulkan.so",
+
+            // CPU variants (ARM tier — armv8.0 / 8.2 / 8.6 / 9.0 / 9.2).
+            // ggml_backend_load runs each one's ggml_backend_score probe;
+            // variants whose required ISA isn't on the host return 0 and
+            // are rejected without registering.
+            "libggml-cpu-android_armv8.0_1.so",
+            "libggml-cpu-android_armv8.2_1.so",
+            "libggml-cpu-android_armv8.2_2.so",
+            "libggml-cpu-android_armv8.6_1.so",
+            "libggml-cpu-android_armv9.0_1.so",
+            "libggml-cpu-android_armv9.2_1.so",
+            "libggml-cpu-android_armv9.2_2.so",
+        };
+
+        int32 RegisteredCount = 0;
+        for (const char* Soname : AndroidBackendSonames)
+        {
+            if (GApi.ggml_backend_load(Soname) != nullptr)
+            {
+                ++RegisteredCount;
+                UE_LOG(LogInoLlama, Log,
+                       TEXT("LlamaCpp: Module: registered backend %s"),
+                       UTF8_TO_TCHAR(Soname));
+            }
+            else
+            {
+                // Common case (host CPU doesn't support this variant's
+                // ISA, or Vulkan unavailable on this device). The actual
+                // dlopen / score / init failure was logged by llama.cpp's
+                // own log callback at Info or Error level.
+                UE_LOG(LogInoLlama, Verbose,
+                       TEXT("LlamaCpp: Module: backend %s not registered (unsupported on host or load failed)"),
+                       UTF8_TO_TCHAR(Soname));
+            }
+        }
+
+        UE_LOG(LogInoLlama, Log,
+               TEXT("LlamaCpp: Module: registered %d / %d Android backend variants"),
+               RegisteredCount, (int32)UE_ARRAY_COUNT(AndroidBackendSonames));
+
+        if (RegisteredCount == 0)
+        {
+            UE_LOG(LogInoLlama, Error,
+                   TEXT("LlamaCpp: Module: no backend variants registered on Android. ")
+                   TEXT("Subsequent llama_model_load_from_file calls will fail with ")
+                   TEXT("'no backends are loaded'. Verify that the APK actually ships ")
+                   TEXT("the libggml-cpu-android_*.so / libggml-vulkan.so files at ")
+                   TEXT("lib/arm64-v8a/ — re-run setup-llamacpp.ps1 + repackage if missing."));
+        }
+    }
+    else
+    {
+        UE_LOG(LogInoLlama, Error,
+               TEXT("LlamaCpp: Module: ggml_backend_load symbol unresolved — "
+                    "cannot register Android backends."));
+    }
+#endif
 
     // Install the log callback BEFORE llama_backend_init so any startup
     // diagnostics (CPU feature probe, backend registration warnings) hit
