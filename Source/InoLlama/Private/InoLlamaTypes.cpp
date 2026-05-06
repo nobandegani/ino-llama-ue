@@ -141,29 +141,71 @@ namespace InoAgents::LlamaCpp
             return nullptr;
         }
 
+        // Log file size up front so we can spot truncated / partial-
+        // download files when load fails (a partial download still
+        // file-exists but is shorter than expected).
+        const int64 FileSizeBytes = IFileManager::Get().FileSize(*ModelPath);
+
         struct llama_model_params Native = Api->llama_model_default_params();
         Params.ApplyTo(Native);
+
+        UE_LOG(LogInoLlama, Log,
+               TEXT("InoLlama: loading '%s' (size=%.1f MB, n_gpu_layers=%d, mmap=%s, mlock=%s)"),
+               *FPaths::GetCleanFilename(ModelPath),
+               FileSizeBytes / (1024.0 * 1024.0),
+               Params.NumGpuLayers,
+               Params.bUseMmap  ? TEXT("yes") : TEXT("no"),
+               Params.bUseMlock ? TEXT("yes") : TEXT("no"));
 
         const double T0 = FPlatformTime::Seconds();
         const FTCHARToUTF8 PathUtf8(*ModelPath);
         struct llama_model* Model = Api->llama_model_load_from_file(PathUtf8.Get(), Native);
 
+        // Auto-fallback for the common Android failure mode: mmap'ing
+        // files under the FUSE-mounted external storage path
+        // (/storage/emulated/0/Android/data/<pkg>/...) sometimes fails
+        // with EINVAL on certain Android versions. Retry once with mmap
+        // disabled — the file gets read into RAM as a fallback. The
+        // memory cost is the model size (~195 MB for Nano Q4) which is
+        // fine for a phone with 4+ GB RAM.
+#if PLATFORM_ANDROID
+        if (Model == nullptr && Params.bUseMmap)
+        {
+            UE_LOG(LogInoLlama, Warning,
+                   TEXT("InoLlama: model load failed with mmap=on on Android; ")
+                   TEXT("retrying with mmap=off (FUSE-mounted external storage often blocks mmap)."));
+
+            struct llama_model_params Retry = Api->llama_model_default_params();
+            Params.ApplyTo(Retry);
+            Retry.use_mmap = false;
+            Model = Api->llama_model_load_from_file(PathUtf8.Get(), Retry);
+            if (Model != nullptr)
+            {
+                UE_LOG(LogInoLlama, Log,
+                       TEXT("InoLlama: model loaded successfully on the mmap=off retry. ")
+                       TEXT("To skip the failed-attempt cost set Backbone.bUseMmap=false in Project Settings."));
+            }
+        }
+#endif
+
         if (Model == nullptr)
         {
+            // The actual cause was logged via the llama.cpp log callback
+            // installed at module init — point users at it so they
+            // don't think this single line is the whole story.
             const FString Err = FString::Printf(
-                TEXT("llama_model_load_from_file failed for '%s'."), *ModelPath);
+                TEXT("llama_model_load_from_file failed for '%s' ")
+                TEXT("(size=%lld bytes). See the preceding 'llama.cpp:' log lines for the underlying error."),
+                *ModelPath, FileSizeBytes);
             if (OutError) *OutError = Err;
             UE_LOG(LogInoLlama, Error, TEXT("%s"), *Err);
             return nullptr;
         }
 
         UE_LOG(LogInoLlama, Log,
-               TEXT("InoLlama: model loaded '%s' in %.1f ms (n_gpu_layers=%d, mmap=%s, mlock=%s)"),
+               TEXT("InoLlama: model loaded '%s' in %.1f ms"),
                *FPaths::GetCleanFilename(ModelPath),
-               (FPlatformTime::Seconds() - T0) * 1000.0,
-               Params.NumGpuLayers,
-               Params.bUseMmap  ? TEXT("yes") : TEXT("no"),
-               Params.bUseMlock ? TEXT("yes") : TEXT("no"));
+               (FPlatformTime::Seconds() - T0) * 1000.0);
 
         return Model;
     }

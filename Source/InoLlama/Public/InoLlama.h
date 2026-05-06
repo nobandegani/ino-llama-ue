@@ -139,6 +139,23 @@ namespace InoAgents::LlamaCpp
         struct ggml_backend_reg* (*ggml_backend_reg_get)(size_t index) = nullptr;
         const char*              (*ggml_backend_reg_name)(struct ggml_backend_reg* reg) = nullptr;
 
+        // --- Log routing ---
+        // llama.cpp / ggml normally print to stderr; on UE that means
+        // the messages are lost (mobile) or interleaved with the
+        // standard log (desktop). Installing both setters at startup
+        // routes every llama_* / ggml_* log line to LogInoLlama at the
+        // appropriate verbosity, so when llama_model_load_from_file
+        // fails the user sees the actual cause (mmap error, GGUF
+        // version mismatch, allocator failure, etc.) instead of a
+        // bare "failed".
+        //
+        // ggml_log_callback signature (from ggml.h): void(*)(enum
+        // ggml_log_level, const char* text, void* user_data). text
+        // typically ends in '\n' and may contain multiple lines for
+        // CONT-level callbacks.
+        void (*llama_log_set)(ggml_log_callback log_callback, void* user_data) = nullptr;
+        void (*ggml_log_set) (ggml_log_callback log_callback, void* user_data) = nullptr;
+
         // ==================================================================
         // Model, context, vocab, tokenize, decode, sampler.
         // Generally useful for any GGUF consumer (NeuTTS Nano today, future

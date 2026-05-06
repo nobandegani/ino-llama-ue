@@ -319,6 +319,10 @@ namespace
         INO_RESOLVE_LLAMA(ggml_backend_reg_get);
         INO_RESOLVE_LLAMA(ggml_backend_reg_name);
 
+        // Log routing
+        INO_RESOLVE_LLAMA(llama_log_set);
+        INO_RESOLVE_LLAMA(ggml_log_set);
+
         // Model
         INO_RESOLVE_LLAMA(llama_model_default_params);
         INO_RESOLVE_LLAMA(llama_model_load_from_file);
@@ -482,6 +486,60 @@ bool Init()
         UE_LOG(LogInoLlama, Log,
                TEXT("LlamaCpp: Module: ggml_backend_load_all_from_path(nullptr) invoked (Android default search)."));
 #endif
+    }
+
+    // Install the log callback BEFORE llama_backend_init so any startup
+    // diagnostics (CPU feature probe, backend registration warnings) hit
+    // LogInoLlama instead of stderr where mobile builds drop them on the
+    // floor. Set both llama_log_set and ggml_log_set — llama.cpp routes
+    // its own logs through ggml's callback internally, but ggml's lower-
+    // level allocator / loader logs only flow through the ggml setter.
+    {
+        auto LogCallback = +[](enum ggml_log_level Level, const char* Text, void* /*UserData*/)
+        {
+            if (Text == nullptr || *Text == '\0')
+            {
+                return;
+            }
+            // ggml emits trailing newlines on most lines; strip them so
+            // each UE_LOG call doesn't add a blank line.
+            FString Line(UTF8_TO_TCHAR(Text));
+            Line.RemoveFromEnd(TEXT("\n"));
+            Line.RemoveFromEnd(TEXT("\r"));
+            if (Line.IsEmpty())
+            {
+                return;
+            }
+
+            switch (Level)
+            {
+                case GGML_LOG_LEVEL_ERROR:
+                    UE_LOG(LogInoLlama, Error, TEXT("llama.cpp: %s"), *Line);
+                    break;
+                case GGML_LOG_LEVEL_WARN:
+                    UE_LOG(LogInoLlama, Warning, TEXT("llama.cpp: %s"), *Line);
+                    break;
+                case GGML_LOG_LEVEL_INFO:
+                case GGML_LOG_LEVEL_CONT:
+                    UE_LOG(LogInoLlama, Log, TEXT("llama.cpp: %s"), *Line);
+                    break;
+                case GGML_LOG_LEVEL_DEBUG:
+                default:
+                    UE_LOG(LogInoLlama, Verbose, TEXT("llama.cpp: %s"), *Line);
+                    break;
+            }
+        };
+
+        if (GApi.llama_log_set != nullptr)
+        {
+            GApi.llama_log_set(LogCallback, /*user_data*/ nullptr);
+        }
+        if (GApi.ggml_log_set != nullptr)
+        {
+            GApi.ggml_log_set(LogCallback, /*user_data*/ nullptr);
+        }
+        UE_LOG(LogInoLlama, Verbose,
+               TEXT("LlamaCpp: Module: routed llama.cpp / ggml logs to LogInoLlama"));
     }
 
     // Initialise llama.cpp's runtime globals.
