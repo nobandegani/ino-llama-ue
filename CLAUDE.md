@@ -15,22 +15,27 @@ llama.cpp C API; model / context / sampler operations are then driven
 through that vtable.
 
 Staging is hybrid: **Win64 uses upstream's prebuilt Vulkan ZIP**
-(no build toolchain required), while **Android arm64-v8a is built
-from source** out of a vendored submodule. The from-source path on
-Android is non-optional — upstream's Android release asset is
-CPU-only, so building ourselves with `-DGGML_VULKAN=ON` is the only
-way to get GPU offload on Android.
+(no build toolchain required), **Android arm64-v8a is built from
+source** out of a vendored submodule, and **Mac + iOS use upstream's
+prebuilt XCFramework**. The from-source path on Android is non-optional
+— upstream's Android release asset is CPU-only, so building ourselves
+with `-DGGML_VULKAN=ON` is the only way to get GPU offload on Android.
+The Mac/iOS XCFramework is upstream's standard Apple-platform delivery
+vehicle and ships with Metal shaders embedded.
 
 llama.cpp is the canonical on-device runtime for **GGUF-format LLMs** —
 Qwen, Phi, Llama, SmolLM, DeepSeek-R1-Distill, TinyLlama, and
 GGUF-derived TTS backbones (NeuTTS Nano's Qwen2-derived backbone today,
 future GGUF consumers tomorrow). It runs on CPU on every platform we
-target, plus Vulkan GPU on **both Win64 and Android**.
+target, plus Vulkan GPU on Win64 / Android and Metal GPU on Apple
+Silicon Mac / iOS.
 
-The plugin is target-platform-aware: **Windows (Win64, CPU + Vulkan)**
-and **Android (arm64-v8a, CPU + Vulkan)** ship today. iOS, Linux, and
-macOS would slot in by adding platform branches to `InoLlama.Build.cs`
-plus the matching staging logic in `setup-llamacpp.ps1`.
+The plugin is target-platform-aware: **Windows (Win64, CPU + Vulkan)**,
+**Android (arm64-v8a, CPU + Vulkan)**, **Mac (universal arm64+x86_64,
+CPU + Metal on arm64)**, and **iOS (arm64 device, CPU + Metal)** ship
+today. Linux would slot in by adding a platform branch to
+`InoLlama.Build.cs` plus the matching staging logic in
+`setup-llamacpp.ps1`.
 
 ## Layout
 
@@ -53,13 +58,17 @@ Plugins/InoLlama/
 └── Source/
     ├── InoLlama/                    ← The single UE module
     │   ├── InoLlama.Build.cs        ← embeds third-party wiring
-    │   │                              (RuntimeDependencies, UPL, includes)
+    │   │                              (RuntimeDependencies, UPL, frameworks)
     │   ├── InoLlama_UPL_Android.xml ← APK packaging directives
     │   ├── Public/InoLlama.h        ← FInoLlamaModule + LogInoLlama category
     │   │                              + namespace InoAgents::LlamaCpp
     │   │                              (FLlamaCppApi vtable + Init/Shutdown/GetApi)
-    │   └── Private/InoLlama.cpp     ← StartupModule loads DLL chain,
-    │                                  resolves the vtable, registers backends
+    │   └── Private/InoLlama.cpp     ← StartupModule loads DLL/dylib chain
+    │                                  per-platform, resolves the vtable,
+    │                                  registers backends (Win64/Android only —
+    │                                  Mac/iOS backends auto-register via
+    │                                  static-init ctors when the framework
+    │                                  dylib is mapped).
     │
     └── ThirdParty/                  ← staged setup outputs (consumed by UE)
         ├── Public/                  ← llama.cpp C API headers
@@ -70,14 +79,27 @@ Plugins/InoLlama/
         │   ├── ggml-cpu-*.dll              (14 microarch CPU variants)
         │   ├── ggml-vulkan.dll             (Vulkan backend)
         │   └── libomp140.x86_64.dll        (MSVC OpenMP redist)
-        └── Android/arm64-v8a/        ← 11 .so files total
-            ├── libllama.so
-            ├── libggml.so + libggml-base.so
-            ├── libggml-vulkan.so            (Vulkan backend, built from source)
-            └── libggml-cpu-android_*.so    (7 ARM tier variants:
-                                             armv8.0_1, armv8.2_1, armv8.2_2,
-                                             armv8.6_1, armv9.0_1, armv9.2_1,
-                                             armv9.2_2)
+        ├── Android/arm64-v8a/        ← 11 .so files total
+        │   ├── libllama.so
+        │   ├── libggml.so + libggml-base.so
+        │   ├── libggml-vulkan.so            (Vulkan backend, built from source)
+        │   └── libggml-cpu-android_*.so    (7 ARM tier variants:
+        │                                    armv8.0_1, armv8.2_1, armv8.2_2,
+        │                                    armv8.6_1, armv9.0_1, armv9.2_1,
+        │                                    armv9.2_2)
+        ├── Mac/llama.framework/      ← 1 fat dylib (universal arm64+x86_64)
+        │   ├── llama                       (CPU + Metal embedded; arm64 half
+        │   │                                has Metal, x86_64 half is CPU-only)
+        │   ├── Headers/                    (llama + ggml C API)
+        │   └── Resources/Info.plist        (framework identity)
+        ├── IOS/llama.framework/      ← 1 dylib (arm64 device only)
+        │   ├── llama                       (CPU + Metal embedded)
+        │   ├── Headers/
+        │   └── Info.plist
+        └── IOS/Simulator/llama.framework/   ← 1 fat dylib (arm64+x86_64 sim)
+            ├── llama
+            ├── Headers/
+            └── Info.plist
 ```
 
 ## How other plugins consume this
@@ -120,21 +142,54 @@ The first and currently only consumer is `Plugins/InoAgents/`
 
 ## Target platforms
 
-| Platform              | Status      | Backends |
+| Platform                  | Status        | Backends |
 |---|---|---|
-| **Windows (Win64)**   | ✅ shipping | CPU (14 microarch variants) + Vulkan GPU |
-| **Android (arm64-v8a)** | ✅ shipping | CPU (7 ARM tier variants) + Vulkan GPU |
-| iOS / Linux / macOS   | ⏳ not staged | No staging logic; consumers' vtable is null on these platforms. |
+| **Windows (Win64)**       | ✅ shipping   | CPU (14 microarch variants) + Vulkan GPU |
+| **Android (arm64-v8a)**   | ✅ shipping   | CPU (7 ARM tier variants) + Vulkan GPU |
+| **macOS (arm64+x86_64)**  | ✅ shipping   | CPU + Metal GPU (arm64 half only — Intel macOS is CPU-only because upstream's CI Intel-Mac runner has no GPU to compile Metal against) |
+| **iOS (arm64 device)**    | ✅ shipping   | CPU + Metal GPU |
+| **iOS Simulator (arm64+x86_64)** | ⚙️ staged | CPU + Metal GPU. Framework is staged at `Source/ThirdParty/IOS/Simulator/llama.framework/` for dev iteration in Xcode simulator, but `InoLlama.Build.cs` only wires the device slice into shipped iOS builds (see "iOS simulator" below). |
+| Linux                     | ⏳ not staged | No staging logic; consumers' vtable is null on this platform. |
 
 **No NPU support** — llama.cpp doesn't have a generic NPU backend in
 its release artifacts. Hexagon NPU exists for Snapdragon but requires
 the registration-walled Qualcomm Hexagon SDK; not pursued today.
+Apple Neural Engine has no public ggml backend either.
 
 **Android GPU is built from source** — upstream doesn't publish
 Android Vulkan / OpenCL prebuilts (their Android release asset is
 CPU-only). The `setup-llamacpp.ps1` script builds the vendored source
 under `LlamaCpp/vendor/llama.cpp/` with `-DGGML_VULKAN=ON` against the
 NDK toolchain to produce `libggml-vulkan.so`. See "Setup" below.
+
+**Mac + iOS use upstream's prebuilt XCFramework** — one
+`llama-<tag>-xcframework.zip` covers macos-arm64_x86_64, ios-arm64,
+and ios-arm64_x86_64-simulator (plus tvOS / visionOS slices we ignore).
+Each slice's `llama.framework/llama` is a single dylib with llama +
+ggml + ggml-cpu + ggml-metal + ggml-blas all statically linked
+together; Metal shaders are embedded via
+`-DGGML_METAL_EMBED_LIBRARY=ON` (no separate `default.metallib`).
+Backends self-register at dylib load via static-init constructors —
+the consumer does NOT need to call `ggml_backend_load_all_from_path`
+or `ggml_backend_load` on Apple platforms. This is structurally
+different from the Win64/Android paths which discover backend variants
+at runtime.
+
+**iOS simulator** — the simulator slice is staged for dev convenience
+but isn't wired into `InoLlama.Build.cs`'s `PublicAdditionalFrameworks`
+call, which currently uses the device-only slice. Devs needing
+simulator builds can flip the framework path or add a
+`Target.Architecture`-driven branch as a follow-up; this isn't blocking
+shipped iOS support.
+
+**Mac framework layout (flattened)** — upstream's macOS slice ships
+the "versioned" framework structure (`Versions/A/llama` + symlinks at
+the root). Symlinks in zip files are unreliable on Windows extraction,
+so `setup-llamacpp.ps1` stages a FLATTENED framework (binary + headers
+at the framework root, no `Versions/A/` subdir) when extracting on
+Windows. Mac dyld accepts both layouts for dylib resolution, so the
+flattening is invisible at runtime. iOS frameworks are already flat in
+upstream and copied as-is.
 
 ## Why no DLL renames (unlike InoOnnx)
 
@@ -160,12 +215,12 @@ as unique staging paths) is sufficient. If a future Marketplace plugin
 ships `llama.dll` or `libllama.so`, this can be revisited as a scoped
 follow-up.
 
-## Why dynamic loading only
+## Why dynamic loading only (Win64 / Android / Mac)
 
 `InoLlama.Build.cs` does NOT use `PublicAdditionalLibraries` or
-`PublicDelayLoadDLLs` on either platform. The runtime resolves every
-`llama_*` and `ggml_backend_*` entry via `GetProcAddress` / `dlsym`
-on the loaded handles, populating `FLlamaCppApi`.
+`PublicDelayLoadDLLs` on Win64, Android, or Mac. The runtime resolves
+every `llama_*` and `ggml_backend_*` entry via `GetProcAddress` /
+`dlsym` on the loaded handles, populating `FLlamaCppApi`.
 
 Reasons:
 
@@ -179,6 +234,21 @@ Reasons:
   dynamic linker could fail to satisfy versioned symbol references.
   Keeping the load explicit (`dlopen` via `FPlatformProcess::GetDllHandle`)
   keeps us ABI-isolated.
+- **Mac**: same isolation rationale as Win64/Android. Even though no UE
+  plugin currently ships its own `llama.framework`, keeping the load
+  explicit (dlopen by full path resolved via IPluginManager) means we
+  can never accidentally dyld-bind to a future Marketplace plugin's
+  copy at app launch.
+
+**iOS is the exception** — `PublicAdditionalFrameworks` does double
+duty (adds `-framework llama` to the link command AND embeds the
+framework into the .app's `Frameworks/` directory at packaging time),
+because iOS has no reliable equivalent of `dlopen`-by-full-path that
+works across all supported iOS versions and signing modes (App Store,
+ad-hoc, dev). The framework is auto-loaded by dyld at app launch
+before any UE module runs; `InoLlama.cpp`'s iOS Init populates the
+vtable via `dlsym(RTLD_DEFAULT, ...)` so the consumer-facing API
+stays uniform across platforms — only the load mechanism differs.
 
 ## Setup
 
@@ -195,7 +265,8 @@ The script is idempotent (safe to re-run). It:
    shows the version is already staged AND every required output file
    is present (`llama.dll`, `ggml*.dll`, `ggml-vulkan.dll` on Win64;
    `libllama.so`, `libggml*.so`, `libggml-vulkan.so` on Android; plus
-   public headers and at least one CPU variant per platform).
+   public headers, at least one CPU variant per Win64/Android, and the
+   `llama.framework/llama` binary in each of the three Mac/iOS slices).
 3. **Win64 path:** downloads `llama-<tag>-bin-win-vulkan-x64.zip` from
    GitHub Releases to `LlamaCpp/.cache/` (cached if present), extracts,
    stages 19 library DLLs into `Source/ThirdParty/Win64/`, skipping
@@ -225,9 +296,16 @@ The script is idempotent (safe to re-run). It:
    Then `cmake --build` and stages every `lib(llama|ggml)-*.so` from
    `<build>/bin/` into `Source/ThirdParty/Android/arm64-v8a/`, skipping
    `libllama-common.so`, `libggml-rpc.so`, `libmtmd.so`.
-5. Stages public C API headers from the vendor submodule into
+5. **Mac + iOS path:** downloads `llama-<tag>-xcframework.zip` from
+   GitHub Releases (cached if present), extracts the three slices we
+   ship into `Source/ThirdParty/Mac/llama.framework/` (universal
+   arm64+x86_64), `Source/ThirdParty/IOS/llama.framework/` (arm64
+   device), and `Source/ThirdParty/IOS/Simulator/llama.framework/`
+   (arm64+x86_64 simulator). The Mac slice is FLATTENED on
+   extraction — see "Mac framework layout (flattened)" above.
+6. Stages public C API headers from the vendor submodule into
    `Source/ThirdParty/Public/` (release archives don't bundle them).
-6. Writes the version stamp.
+7. Writes the version stamp.
 
 **First-run cost on the Android side:** the build cross-compiles
 llama.cpp arm64 plus runs `glslc` on ~180 Vulkan compute shaders.
@@ -301,7 +379,7 @@ llama.cpp version starts using a Vulkan symbol or SPIR-V opcode that
 isn't in the currently-pinned headers. ggml-vulkan is generally
 conservative about Vulkan version requirements.
 
-## Vulkan backend note
+## Vulkan backend note (Win64 / Android only)
 
 `ggml-vulkan.dll` statically imports `vulkan-1.dll`. `vulkan-1.dll` is
 part of the Vulkan runtime loader bundled with Windows 10 1803+ and
@@ -311,6 +389,27 @@ of the platform from API 24+. We target API 30+ (matches the hosting
 game's minSdk). ggml-vulkan additionally requires API >= 28 because it
 uses unsuffixed Vulkan 1.1 symbols like `vkGetPhysicalDeviceFeatures2`
 which the NDK's libvulkan.so stub only exposes from API 28 onward.
+
+## Metal backend note (Mac / iOS only)
+
+The Apple slices' `llama.framework/llama` is built with
+`-DGGML_METAL_EMBED_LIBRARY=ON`, which means the Metal shader source
+(`ggml-metal.metal` → compiled `default.metallib`) is baked into the
+dylib's `__DATA,__ggml_metallib` section as a byte blob. At first
+Metal use, ggml maps the section, hands it to
+`MTLDevice.makeLibraryWithData_:` and gets a `MTLLibrary` back without
+ever touching the filesystem. We do not have to ship a separate
+`.metallib` file alongside the framework, and the framework remains a
+single self-contained binary.
+
+Metal requires a Metal-capable `MTLDevice`. On Apple Silicon Macs and
+all iOS devices we ship to, this is always present and the backend
+registers automatically. On Intel Macs and the iOS Simulator x86_64
+slice running on an Intel Mac host, the GPU is unavailable and the
+Metal backend self-rejects at registration time — the runtime backend
+picker then drops back to CPU silently. No fallback handling is
+needed in our code; the auto-registration log printed by `Init()`
+on Apple platforms shows which backends actually came up.
 
 ## CPU variant strategy
 
@@ -368,6 +467,11 @@ Upstream sources:
 - llama.cpp: https://github.com/ggml-org/llama.cpp
 - Vulkan-Headers: https://github.com/KhronosGroup/Vulkan-Headers
 - SPIRV-Headers: https://github.com/KhronosGroup/SPIRV-Headers
+
+Upstream release artifacts we consume:
+- Win64: `llama-<tag>-bin-win-vulkan-x64.zip`
+- Mac + iOS: `llama-<tag>-xcframework.zip` (one zip, three slices)
+- Android: built from source via `LlamaCpp/vendor/llama.cpp` submodule
 
 Pinned versions (edit + re-run setup to bump):
 - `LlamaCpp/LLAMACPP_VERSION` — llama.cpp build tag

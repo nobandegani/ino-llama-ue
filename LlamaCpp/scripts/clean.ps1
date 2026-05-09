@@ -18,6 +18,8 @@ $Targets = @(
     (Join-Path $PluginDir   "Source\ThirdParty\Public"),
     (Join-Path $PluginDir   "Source\ThirdParty\Win64"),
     (Join-Path $PluginDir   "Source\ThirdParty\Android"),
+    (Join-Path $PluginDir   "Source\ThirdParty\Mac"),
+    (Join-Path $PluginDir   "Source\ThirdParty\IOS"),
     (Join-Path $PluginDir   "Source\ThirdParty\.llamacpp_version")
 )
 

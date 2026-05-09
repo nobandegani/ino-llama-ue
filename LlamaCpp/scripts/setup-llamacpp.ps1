@@ -2,7 +2,7 @@
 #
 # Hybrid setup (idempotent) for the InoLlama plugin.
 #
-# Two staging paths from a single pinned llama.cpp version:
+# Four staging paths from a single pinned llama.cpp version:
 #
 #   Win64 (prebuilt download)
 #     Downloads upstream's `llama-<tag>-bin-win-vulkan-x64.zip` and stages
@@ -25,10 +25,41 @@
 #     library from API 24+). Building ourselves is the only path to
 #     Android GPU offload.
 #
-#   Public C API headers (both platforms)
+#   Mac + iOS (XCFramework download)
+#     Downloads upstream's `llama-<tag>-xcframework.zip` and extracts the
+#     three slices we ship into:
+#         Source/ThirdParty/Mac/llama.framework/             (universal — arm64 + x86_64)
+#         Source/ThirdParty/IOS/llama.framework/             (device — arm64)
+#         Source/ThirdParty/IOS/Simulator/llama.framework/   (simulator — arm64 + x86_64)
+#
+#     The XCFramework's `llama.framework/llama` is a single dynamic library
+#     containing llama + ggml + ggml-cpu + ggml-metal + ggml-blas all
+#     statically linked together (Metal shaders are EMBEDDED via
+#     -DGGML_METAL_EMBED_LIBRARY=ON, so no separate default.metallib).
+#     Backends self-register at dylib load via static-init constructors —
+#     no ggml_backend_load_all_from_path needed on Apple platforms.
+#
+#     Mac framework structure on disk: the upstream macOS slice ships the
+#     "versioned" framework layout (Versions/A/llama + symlinks at root).
+#     Symlinks in zip files are unreliable on Windows extraction, so we
+#     stage a FLATTENED framework (binary + headers at the framework
+#     root, no Versions/A/ subdir). Mac dyld accepts both layouts.
+#
+#     iOS framework structure: already flat in upstream (no symlinks),
+#     copied as-is.
+#
+#     Intel macOS (x86_64) does NOT get Metal — upstream's CI builds the
+#     x64 slice with -DGGML_METAL=OFF because their Intel Mac runners
+#     have no GPU. The arm64_x86_64 universal binary therefore has Metal
+#     for the arm64 half only. Apple Silicon Macs are the GPU-offload
+#     target; Intel Macs fall back to CPU. KleidiAI variant is NOT
+#     pulled in (we use the standard arm64 slice; KleidiAI is a future
+#     CPU-tier optimization not worth the extra download).
+#
+#   Public C API headers (all platforms)
 #     Staged from the vendor submodule — Source/ThirdParty/Public/llama.h,
 #     ggml.h, ggml-{alloc,backend,cpu,opt}.h, gguf.h. Same source-of-truth
-#     as the Android build inputs.
+#     as the Android build inputs and the XCFramework's bundled headers.
 #
 # Pinned version lives in:
 #   LlamaCpp/LLAMACPP_VERSION                    (e.g. "b9016")
@@ -54,9 +85,9 @@
 #
 # Idempotency stamp: Source/ThirdParty/.llamacpp_version. If the stamp
 # matches LLAMACPP_VERSION AND every required staged file is present
-# (now including libggml-vulkan.so on Android), we skip both the Win64
-# download and the Android build. To force re-stage: delete the stamp
-# file or run clean.ps1.
+# (Win64 DLLs, Android .so files including libggml-vulkan.so, and the
+# Mac + iOS llama.framework binaries), we skip every download/build path.
+# To force re-stage: delete the stamp file or run clean.ps1.
 
 $ErrorActionPreference = "Stop"
 
@@ -71,10 +102,13 @@ $VulkanHeadersFile  = Join-Path $LlamaCppDir "VULKAN_HEADERS_VERSION"
 $CacheDir     = Join-Path $LlamaCppDir ".cache"
 $VendorSrcDir = Join-Path $LlamaCppDir "vendor\llama.cpp"
 
-$ThirdPartyDir    = Join-Path $PluginDir "Source\ThirdParty"
-$PublicIncDir     = Join-Path $ThirdPartyDir "Public"
-$Win64BinStageDir = Join-Path $ThirdPartyDir "Win64"
-$Arm64BinStageDir = Join-Path $ThirdPartyDir "Android\arm64-v8a"
+$ThirdPartyDir       = Join-Path $PluginDir "Source\ThirdParty"
+$PublicIncDir        = Join-Path $ThirdPartyDir "Public"
+$Win64BinStageDir    = Join-Path $ThirdPartyDir "Win64"
+$Arm64BinStageDir    = Join-Path $ThirdPartyDir "Android\arm64-v8a"
+$MacFrameworkDir     = Join-Path $ThirdPartyDir "Mac\llama.framework"
+$IosFrameworkDir     = Join-Path $ThirdPartyDir "IOS\llama.framework"
+$IosSimFrameworkDir  = Join-Path $ThirdPartyDir "IOS\Simulator\llama.framework"
 
 $StampFile = Join-Path $ThirdPartyDir ".llamacpp_version"
 
@@ -142,12 +176,20 @@ function Test-StagedComplete {
     if ($winCpuVariants.Count -eq 0) { return $false }
     $androidCpuVariants = @(Get-ChildItem -Path $Arm64BinStageDir -Filter "libggml-cpu-*.so" -File -ErrorAction SilentlyContinue)
     if ($androidCpuVariants.Count -eq 0) { return $false }
+
+    # Mac + iOS llama.framework binaries (single dylib per slice; backends
+    # are statically linked into it, so the binary file is the only thing
+    # we have to check for existence — there is no per-arch CPU-variant
+    # glob like there is on Win64/Android).
+    if (-not (Test-Path (Join-Path $MacFrameworkDir    "llama"))) { return $false }
+    if (-not (Test-Path (Join-Path $IosFrameworkDir    "llama"))) { return $false }
+    if (-not (Test-Path (Join-Path $IosSimFrameworkDir "llama"))) { return $false }
     return $true
 }
 
 if (Test-StagedComplete) {
     Write-Host "--- Already up to date ---" -ForegroundColor Green
-    Write-Host "  llama.cpp $Version staged (Win64 + Android arm64-v8a)."
+    Write-Host "  llama.cpp $Version staged (Win64 + Android arm64-v8a + Mac + iOS device + iOS simulator)."
     Write-Host "  Delete '$StampFile' or bump LLAMACPP_VERSION to force re-stage."
     exit 0
 }
@@ -155,7 +197,11 @@ if (Test-StagedComplete) {
 #---------------------------------------------------------------------
 # 3. Preflight: create directories + helpers
 #---------------------------------------------------------------------
-foreach ($d in @($CacheDir, $PublicIncDir, $Win64BinStageDir, $Arm64BinStageDir)) {
+$MacStageRoot = Join-Path $ThirdPartyDir "Mac"
+$IosStageRoot = Join-Path $ThirdPartyDir "IOS"
+$IosSimStageRoot = Join-Path $ThirdPartyDir "IOS\Simulator"
+
+foreach ($d in @($CacheDir, $PublicIncDir, $Win64BinStageDir, $Arm64BinStageDir, $MacStageRoot, $IosStageRoot, $IosSimStageRoot)) {
     if (-not (Test-Path $d)) {
         New-Item -ItemType Directory -Path $d -Force | Out-Null
     }
@@ -529,6 +575,141 @@ Write-Host "  Staged $AndroidStaged Android .so files total; $($AndroidCpuStaged
 Write-Host ""
 
 #=====================================================================
+# MAC + iOS: download upstream's XCFramework, stage three slices
+#=====================================================================
+# The XCFramework is one zip (~30 MB) covering Apple's whole platform
+# matrix. We extract three of its slices:
+#   macos-arm64_x86_64        -> Source/ThirdParty/Mac/llama.framework/
+#   ios-arm64                 -> Source/ThirdParty/IOS/llama.framework/
+#   ios-arm64_x86_64-simulator-> Source/ThirdParty/IOS/Simulator/llama.framework/
+#
+# tvOS / visionOS slices in the same zip are intentionally ignored.
+#
+# Each slice's llama.framework/llama is a single dylib with llama + ggml
+# + ggml-cpu + ggml-metal + ggml-blas all statically linked together,
+# Metal shaders embedded (-DGGML_METAL_EMBED_LIBRARY=ON). Backends self-
+# register at dylib load via static-init constructors, so the consumer
+# does not need to call ggml_backend_load_all_from_path on Apple
+# platforms.
+Write-Host "=== Mac + iOS (XCFramework) ===" -ForegroundColor Cyan
+
+$XcfZipName  = "llama-$Version-xcframework.zip"
+$XcfZipPath  = Join-Path $CacheDir $XcfZipName
+$XcfZipUrl   = "$ReleaseBase/$XcfZipName"
+
+Write-Host "--- Downloading XCFramework artifact ---" -ForegroundColor Yellow
+Download-IfMissing -Url $XcfZipUrl -Dest $XcfZipPath -Label "Apple XCFramework" -MinSizeMb 5
+
+Write-Host "--- Extracting + staging Apple slices ---" -ForegroundColor Yellow
+$XcfExtractDir = Join-Path $CacheDir "apple-extract-$Version"
+if (Test-Path $XcfExtractDir) { Remove-Item -Recurse -Force $XcfExtractDir }
+New-Item -ItemType Directory -Path $XcfExtractDir -Force | Out-Null
+Expand-Archive -Path $XcfZipPath -DestinationPath $XcfExtractDir -Force
+
+# Locate llama.xcframework inside the extracted tree (could be at root
+# or one level deep depending on how upstream zipped it).
+$XcfRootCandidates = @(Get-ChildItem -Path $XcfExtractDir -Filter "llama.xcframework" -Directory -Recurse)
+if ($XcfRootCandidates.Count -eq 0) {
+    Write-Error "llama.xcframework not found anywhere inside $XcfZipName extract. Upstream may have changed the layout — inspect $XcfExtractDir."
+}
+$XcfRoot = $XcfRootCandidates[0].FullName
+Write-Host "  Detected XCFramework root: $XcfRoot"
+
+# Helper: stage one slice's llama.framework into a destination, flattening
+# the macOS "versioned" framework structure (Versions/A/llama -> root)
+# because Windows handling of zip-embedded symlinks is unreliable. iOS
+# frameworks are already flat in upstream so the flattening pass is a
+# no-op for them.
+function Stage-AppleFramework {
+    param(
+        [Parameter(Mandatory)] [string]$SliceDir,    # e.g. <xcf-root>/macos-arm64_x86_64
+        [Parameter(Mandatory)] [string]$DestFwDir,   # e.g. Source/ThirdParty/Mac/llama.framework
+        [Parameter(Mandatory)] [string]$Label        # for logging
+    )
+
+    if (-not (Test-Path $SliceDir)) {
+        Write-Error "[$Label] slice not found: $SliceDir (XCFramework upstream layout may have changed)"
+    }
+
+    $SrcFw = Join-Path $SliceDir "llama.framework"
+    if (-not (Test-Path $SrcFw)) {
+        Write-Error "[$Label] llama.framework missing inside slice: $SrcFw"
+    }
+
+    # Wipe any prior staging so removed-upstream files don't linger.
+    if (Test-Path $DestFwDir) {
+        Remove-Item -Recurse -Force $DestFwDir
+    }
+    New-Item -ItemType Directory -Path $DestFwDir -Force | Out-Null
+
+    # Determine layout. macOS slice has Versions/A/{llama, Headers, Resources};
+    # iOS slices are flat (./llama, ./Headers, etc.).
+    $VersionedBin = Join-Path $SrcFw "Versions\A\llama"
+    $FlatBin      = Join-Path $SrcFw "llama"
+
+    if ((Test-Path $VersionedBin -PathType Leaf) -and ((Get-Item $VersionedBin).Length -gt 1MB)) {
+        # Versioned framework — copy contents of Versions/A/* to dest root,
+        # skipping the symlinks at the framework root.
+        $VersionsA = Join-Path $SrcFw "Versions\A"
+        Get-ChildItem -Path $VersionsA -Force | ForEach-Object {
+            Copy-Item -Path $_.FullName -Destination $DestFwDir -Recurse -Force
+        }
+        $stagedBin = Join-Path $DestFwDir "llama"
+        $mb = [math]::Round((Get-Item $stagedBin).Length / 1MB, 2)
+        Write-Host "  [STAGE] $Label (versioned -> flat) -> $DestFwDir/llama ($mb MB)"
+    }
+    elseif ((Test-Path $FlatBin -PathType Leaf) -and ((Get-Item $FlatBin).Length -gt 1MB)) {
+        # Already flat — copy whole framework dir contents.
+        Get-ChildItem -Path $SrcFw -Force | ForEach-Object {
+            # Skip Versions/ subdir if it happens to exist alongside the flat
+            # binary (would only happen on a hybrid layout we don't expect).
+            if ($_.Name -ieq "Versions") { return }
+            Copy-Item -Path $_.FullName -Destination $DestFwDir -Recurse -Force
+        }
+        $stagedBin = Join-Path $DestFwDir "llama"
+        $mb = [math]::Round((Get-Item $stagedBin).Length / 1MB, 2)
+        Write-Host "  [STAGE] $Label (flat) -> $DestFwDir/llama ($mb MB)"
+    }
+    else {
+        Write-Error "[$Label] could not locate llama binary inside $SrcFw — neither $VersionedBin nor $FlatBin is a real file. Windows extraction may have broken symlinks; inspect the extracted slice."
+    }
+
+    # Sanity: ensure the staged binary is a real file (not a 0-byte stub
+    # or a Windows-extracted broken symlink).
+    $StagedBin = Join-Path $DestFwDir "llama"
+    if (-not (Test-Path $StagedBin -PathType Leaf)) {
+        Write-Error "[$Label] staging completed but $StagedBin is missing."
+    }
+    if ((Get-Item $StagedBin).Length -lt 1MB) {
+        Write-Error "[$Label] staged binary $StagedBin is suspiciously small ($((Get-Item $StagedBin).Length) bytes) — extraction probably hit a broken symlink. Try deleting $XcfExtractDir and re-running."
+    }
+}
+
+# 1. macOS universal (arm64 + x86_64). arm64 half has Metal; x86_64 half
+#    is CPU-only (upstream's CI Intel runner has no GPU).
+Stage-AppleFramework `
+    -SliceDir (Join-Path $XcfRoot "macos-arm64_x86_64") `
+    -DestFwDir $MacFrameworkDir `
+    -Label "Mac (universal)"
+
+# 2. iOS device (arm64 only — Apple dropped 32-bit + simulator-on-device
+#    long ago).
+Stage-AppleFramework `
+    -SliceDir (Join-Path $XcfRoot "ios-arm64") `
+    -DestFwDir $IosFrameworkDir `
+    -Label "iOS device (arm64)"
+
+# 3. iOS simulator (arm64 + x86_64 fat). arm64 covers Apple Silicon Mac
+#    hosts running the simulator; x86_64 covers Intel Mac hosts. Devs
+#    iterating in Xcode simulator need this slice.
+Stage-AppleFramework `
+    -SliceDir (Join-Path $XcfRoot "ios-arm64_x86_64-simulator") `
+    -DestFwDir $IosSimFrameworkDir `
+    -Label "iOS simulator (arm64 + x86_64)"
+
+Write-Host ""
+
+#=====================================================================
 # 8. Public C API headers (from vendor submodule, both platforms)
 #=====================================================================
 # Headers aren't bundled in the Windows release ZIP. We stage them
@@ -583,6 +764,19 @@ $andItems | ForEach-Object {
     Write-Host "  - $($_.Name) ($mb MB)"
 }
 Write-Host ("  [{0} files]" -f $andItems.Count)
+Write-Host ""
+Write-Host "Staged binaries (Apple — Mac universal + iOS device + iOS simulator):"
+foreach ($entry in @(
+    @{ Path = $MacFrameworkDir;    Label = "Mac/llama.framework/llama" },
+    @{ Path = $IosFrameworkDir;    Label = "IOS/llama.framework/llama" },
+    @{ Path = $IosSimFrameworkDir; Label = "IOS/Simulator/llama.framework/llama" }
+)) {
+    $bin = Join-Path $entry.Path "llama"
+    if (Test-Path $bin) {
+        $mb = [math]::Round((Get-Item $bin).Length / 1MB, 2)
+        Write-Host "  - $($entry.Label) ($mb MB)"
+    }
+}
 Write-Host ""
 Write-Host "Staged headers:"
 Get-ChildItem -Path $PublicIncDir -File | Sort-Object Name | ForEach-Object {

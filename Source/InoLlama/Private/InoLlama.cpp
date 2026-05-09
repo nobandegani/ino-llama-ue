@@ -21,6 +21,17 @@
     #include "Windows/HideWindowsPlatformTypes.h"
 #endif
 
+#if PLATFORM_MAC || PLATFORM_IOS
+    // For dlsym(RTLD_DEFAULT, ...) — used on iOS to resolve symbols from
+    // the auto-linked llama.framework (UE's PublicAdditionalFrameworks +
+    // dyld take care of loading; we just need to look symbols up against
+    // the global namespace). Mac also uses RTLD_DEFAULT as a fallback if
+    // the explicit GetDllHandle on the framework binary somehow returned
+    // a handle that doesn't expose every symbol (defensive — should not
+    // happen with a single monolithic dylib, but cheap to keep).
+    #include <dlfcn.h>
+#endif
+
 // Single definition for the shared log category declared in InoLlama.h.
 DEFINE_LOG_CATEGORY(LogInoLlama);
 
@@ -47,6 +58,16 @@ namespace
      *
      * On Android, only LlamaMain is populated; the Android linker
      * manages libggml*.so load/unload transparently.
+     *
+     * On Mac, only LlamaMain is populated — it points at the framework
+     * binary loaded explicitly via FPlatformProcess::GetDllHandle by full
+     * path. Backends (CPU + Metal) are statically linked into the same
+     * dylib and self-register at load via static-init constructors.
+     *
+     * On iOS, NO handle is populated. The framework is auto-loaded by
+     * dyld at app launch (declared via PublicAdditionalFrameworks in the
+     * Build.cs); we resolve symbols against the global namespace via
+     * dlsym(RTLD_DEFAULT) and have nothing to FreeDllHandle in Shutdown.
      */
     struct FDllHandles
     {
@@ -54,7 +75,7 @@ namespace
         void* GgmlBase    = nullptr;   // ggml-base.dll / libggml-base.so
         void* Ggml        = nullptr;   // ggml.dll / libggml.so
         void* GgmlVulkan  = nullptr;   // ggml-vulkan.dll (Windows only)
-        void* LlamaMain   = nullptr;   // llama.dll / libllama.so
+        void* LlamaMain   = nullptr;   // llama.dll / libllama.so / llama.framework/llama
     };
     FDllHandles GHandles;
 
@@ -71,6 +92,17 @@ namespace
      *   process). The UPL's soLoadLibrary preload has already mapped
      *   the .so into the process, so dlopen just returns the existing
      *   handle.
+     *
+     * Mac: absolute path to the staged framework binary
+     *   (Source/ThirdParty/Mac/llama.framework/llama), resolved via
+     *   IPluginManager. Mac dyld accepts framework binaries as plain
+     *   dylibs for dlopen even when the framework's versioned-layout
+     *   symlinks aren't present (we stage a flattened framework).
+     *
+     * iOS: returns empty. The framework is auto-loaded by dyld at app
+     *   launch (PublicAdditionalFrameworks bCopyFramework=true), so
+     *   there is no GetDllHandle step — Init() detects the empty path
+     *   and skips straight to symbol resolution against RTLD_DEFAULT.
      */
     FString ResolveMainLibraryPath()
     {
@@ -86,6 +118,20 @@ namespace
             TEXT("llama.dll"));
 #elif PLATFORM_ANDROID
         return FString(TEXT("libllama.so"));
+#elif PLATFORM_MAC
+        const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("InoLlama"));
+        if (!Plugin.IsValid())
+        {
+            return FString();
+        }
+        return FPaths::Combine(
+            Plugin->GetBaseDir(),
+            TEXT("Source/ThirdParty/Mac/llama.framework"),
+            TEXT("llama"));
+#elif PLATFORM_IOS
+        // Sentinel: empty path tells Init() to skip dlopen and go
+        // straight to dlsym(RTLD_DEFAULT) for vtable resolution.
+        return FString();
 #else
         return FString();
 #endif
@@ -245,6 +291,15 @@ namespace
     /**
      * Resolve a function pointer by searching a list of DLL handles in
      * order. Returns nullptr if none of the handles export the symbol.
+     *
+     * Apple-only fallback: if every handle search misses (or the handle
+     * list is empty, as on iOS where the framework is auto-loaded by
+     * dyld and we keep no explicit handle), try dlsym(RTLD_DEFAULT, ...)
+     * which searches the process's global namespace. iOS RELIES on this
+     * fallback. Mac uses the explicit handle path normally and only
+     * touches the fallback as defence-in-depth (e.g. if a future Apple
+     * dyld behaviour change makes the framework's binary load via a
+     * different handle than the one we got back from GetDllHandle).
      */
     void* ResolveExport(const TCHAR* Name, std::initializer_list<void*> Handles)
     {
@@ -256,6 +311,15 @@ namespace
                 return P;
             }
         }
+#if PLATFORM_MAC || PLATFORM_IOS
+        {
+            FTCHARToUTF8 NameUtf8(Name);
+            if (void* P = dlsym(RTLD_DEFAULT, NameUtf8.Get()))
+            {
+                return P;
+            }
+        }
+#endif
         return nullptr;
     }
 
@@ -406,7 +470,7 @@ bool Init()
            TEXT("LlamaCpp: Module: starting llama.cpp load"));
     const double InitStartTime = FPlatformTime::Seconds();
 
-#if PLATFORM_WINDOWS || PLATFORM_ANDROID
+#if PLATFORM_WINDOWS || PLATFORM_ANDROID || PLATFORM_MAC || PLATFORM_IOS
 
 #if PLATFORM_WINDOWS
     // Preload every sibling DLL by full path. Seeds Windows' base-name
@@ -428,8 +492,29 @@ bool Init()
     }
 #endif // PLATFORM_WINDOWS
 
-    // Load the main library (llama.dll / libllama.so).
+    // Load the main library. On Win64/Android/Mac we get back an explicit
+    // handle (full path on Win64/Mac, bare soname on Android). On iOS the
+    // framework is auto-loaded by dyld at app launch via the linker's
+    // -framework reference (PublicAdditionalFrameworks), so the resolver
+    // returns an empty path as a sentinel and we skip GetDllHandle —
+    // ResolveApi will populate the vtable via dlsym(RTLD_DEFAULT) against
+    // the process's global namespace.
     const FString MainLibPath = ResolveMainLibraryPath();
+#if PLATFORM_IOS
+    // iOS-only path: framework is already in the process; nothing to load.
+    if (!MainLibPath.IsEmpty())
+    {
+        // Defensive — shouldn't happen with the current ResolveMainLibraryPath
+        // implementation but guards against future refactors.
+        UE_LOG(LogInoLlama, Warning,
+               TEXT("LlamaCpp: Module: iOS Init received non-empty MainLibPath '%s'; ")
+               TEXT("ignoring (iOS uses auto-linked framework + RTLD_DEFAULT, not explicit dlopen)."),
+               *MainLibPath);
+    }
+    UE_LOG(LogInoLlama, Verbose,
+           TEXT("LlamaCpp: Module: iOS — relying on dyld-loaded llama.framework; ")
+           TEXT("vtable will resolve via dlsym(RTLD_DEFAULT)."));
+#else
     if (MainLibPath.IsEmpty())
     {
         UE_LOG(LogInoLlama, Warning,
@@ -452,6 +537,7 @@ bool Init()
     UE_LOG(LogInoLlama, Log,
            TEXT("LlamaCpp: Module: GetDllHandle succeeded for %s (handle=%p)"),
            *MainLibPath, GHandles.LlamaMain);
+#endif // !PLATFORM_IOS
 
 #if PLATFORM_WINDOWS
     VerifyLoadedPath(TEXT("llama.dll"), MainLibPath);
@@ -563,6 +649,33 @@ bool Init()
                TEXT("LlamaCpp: Module: ggml_backend_load symbol unresolved — "
                     "cannot register Android backends."));
     }
+#elif PLATFORM_MAC || PLATFORM_IOS
+    // Mac + iOS: nothing to register manually. The XCFramework's
+    // llama.framework/llama dylib statically links every backend (CPU +
+    // Metal + Accelerate/BLAS) and each one self-registers at dylib load
+    // via static-init constructors (the `ggml_backend_register` C++ ctor
+    // pattern that fires before `main` / `dlopen` returns). By the time
+    // we reach this point the registered-backends list is already full.
+    //
+    // Optional sanity log: enumerate what registered. Useful for catching
+    // "Metal didn't register because we're on Intel macOS / iOS Simulator
+    // x86_64 host that has no Metal device" cases without having to wait
+    // for the first model load to fail.
+    if (GApi.ggml_backend_reg_count != nullptr && GApi.ggml_backend_reg_get != nullptr && GApi.ggml_backend_reg_name != nullptr)
+    {
+        const size_t Count = GApi.ggml_backend_reg_count();
+        FString BackendList;
+        for (size_t i = 0; i < Count; ++i)
+        {
+            struct ggml_backend_reg* Reg = GApi.ggml_backend_reg_get(i);
+            const char* Name = (Reg != nullptr) ? GApi.ggml_backend_reg_name(Reg) : nullptr;
+            if (i > 0) { BackendList += TEXT(", "); }
+            BackendList += (Name != nullptr) ? UTF8_TO_TCHAR(Name) : TEXT("(unknown)");
+        }
+        UE_LOG(LogInoLlama, Log,
+               TEXT("LlamaCpp: Module: %d backend(s) auto-registered by static-init ctors: %s"),
+               (int32)Count, *BackendList);
+    }
 #endif
 
     // Install the log callback BEFORE llama_backend_init so any startup
@@ -649,7 +762,7 @@ bool Init()
     return true;
 
 #else
-    // iOS / Linux / macOS: not yet implemented.
+    // Linux / other platforms: not yet implemented.
     UE_LOG(LogInoLlama, Warning,
            TEXT("LlamaCpp: Module: llama.cpp is not yet available on this platform."));
     return false;
@@ -679,8 +792,13 @@ void Shutdown()
     // Zero the vtable now.
     GApi = FLlamaCppApi{};
 
-#if PLATFORM_WINDOWS || PLATFORM_ANDROID
-    // Release in reverse dependency order.
+#if PLATFORM_WINDOWS || PLATFORM_ANDROID || PLATFORM_MAC || PLATFORM_IOS
+    // Release in reverse dependency order. Mac populates only LlamaMain
+    // (the framework binary handle); the rest of the slots are nullptr
+    // and the lambda no-ops on them. iOS populates none of them — the
+    // framework was loaded by dyld at app launch, not by us, and we have
+    // no business unloading it (and dlclose on RTLD_DEFAULT is illegal
+    // anyway).
     auto Free = [](const TCHAR* Name, void*& Handle)
     {
         if (Handle != nullptr)

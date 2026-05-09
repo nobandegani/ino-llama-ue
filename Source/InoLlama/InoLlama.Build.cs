@@ -59,9 +59,9 @@ public class InoLlama : ModuleRules
 		// This is the only UE module in the plugin, so it owns the third-party
 		// wiring directly (no separate external module). Build artifacts are
 		// produced by Plugins/InoLlama/LlamaCpp/scripts/setup-llamacpp.ps1
-		// which uses a hybrid strategy: prebuilt download for Win64, from-source
-		// build (vendored submodule) for Android. Outputs are staged into the
-		// consolidated tree:
+		// which uses a hybrid strategy: prebuilt download for Win64 + Mac + iOS,
+		// from-source build (vendored submodule) for Android. Outputs are
+		// staged into the consolidated tree:
 		//
 		//     Source/ThirdParty/Public/                       llama.cpp C API headers
 		//     Source/ThirdParty/Win64/                        19 DLLs (llama + ggml +
@@ -70,8 +70,23 @@ public class InoLlama : ModuleRules
 		//     Source/ThirdParty/Android/arm64-v8a/            11 .so files (libllama +
 		//                                                     libggml + 7 ARM tier
 		//                                                     CPU variants + Vulkan)
+		//     Source/ThirdParty/Mac/llama.framework/          1 fat dylib (arm64+x86_64)
+		//                                                     with CPU + Metal backends
+		//                                                     statically linked + Metal
+		//                                                     shaders embedded
+		//     Source/ThirdParty/IOS/llama.framework/          1 dylib (arm64 device)
+		//     Source/ThirdParty/IOS/Simulator/llama.framework/ 1 fat dylib
+		//                                                     (arm64 + x86_64 simulator)
 		//
 		// Win64 staging comes from upstream's `llama-<tag>-bin-win-vulkan-x64.zip`.
+		// Mac + iOS staging comes from upstream's `llama-<tag>-xcframework.zip`
+		// (one zip, three slices: macos-arm64_x86_64, ios-arm64,
+		// ios-arm64_x86_64-simulator). Each Apple slice's framework binary is a
+		// single dylib containing llama + ggml + ggml-cpu + ggml-metal + ggml-blas
+		// statically linked together; Metal shaders are embedded
+		// (-DGGML_METAL_EMBED_LIBRARY=ON, no separate default.metallib).
+		// Backends self-register at dylib load via static-init constructors —
+		// no ggml_backend_load_all_from_path call needed on Apple platforms.
 		// Android staging is built from the LlamaCpp/vendor/llama.cpp/ submodule
 		// at the same pinned tag, with -DGGML_VULKAN=ON, because upstream's
 		// `llama-<tag>-bin-android-arm64.tar.gz` release is CPU-only and they
@@ -116,10 +131,12 @@ public class InoLlama : ModuleRules
 		//   needs Vulkan 1.1 symbols like vkGetPhysicalDeviceFeatures2,
 		//   exposed by the NDK libvulkan.so stub from API 28 onward.
 
-		string ThirdPartyDir  = Path.Combine(PluginDirectory, "Source", "ThirdParty");
-		string PublicDir      = Path.Combine(ThirdPartyDir, "Public");
-		string Win64Dir       = Path.Combine(ThirdPartyDir, "Win64");
-		string AndroidBaseDir = Path.Combine(ThirdPartyDir, "Android");
+		string ThirdPartyDir   = Path.Combine(PluginDirectory, "Source", "ThirdParty");
+		string PublicDir       = Path.Combine(ThirdPartyDir, "Public");
+		string Win64Dir        = Path.Combine(ThirdPartyDir, "Win64");
+		string AndroidBaseDir  = Path.Combine(ThirdPartyDir, "Android");
+		string MacFrameworkDir = Path.Combine(ThirdPartyDir, "Mac", "llama.framework");
+		string IosBaseDir      = Path.Combine(ThirdPartyDir, "IOS");
 
 		// Public headers — consumers do
 		//     #include "llama.h"
@@ -241,8 +258,91 @@ public class InoLlama : ModuleRules
 				"AndroidPlugin",
 				Path.Combine(ModuleDirectory, "InoLlama_UPL_Android.xml"));
 		}
-		// iOS / Linux / macOS: not yet implemented. Linking succeeds because
-		// no static references; runtime calls fail gracefully when the
-		// dynamic load can't find the library.
+		else if (Target.Platform == UnrealTargetPlatform.Mac)
+		{
+			// Mac: dynamic loading only — same isolation rationale as Win64
+			// and Android. Even though no UE plugin currently ships its own
+			// llama.framework, keeping the load explicit (dlopen by full
+			// path) means we can never accidentally dyld-bind to a future
+			// Marketplace plugin's copy at app launch.
+			//
+			// The framework's binary is the ONLY file we have to ship at
+			// runtime: backends (CPU + Metal) are statically linked into
+			// it and self-register via static-init constructors when the
+			// dylib is mapped, so there is no ggml-cpu-*.so / Vulkan side-
+			// car analog to enumerate. RuntimeDependencies.Add stages the
+			// binary into the packaged .app where IPluginManager-resolved
+			// paths can find it again at runtime.
+			//
+			// The .framework directory layout we stage is FLATTENED (binary
+			// + Headers/ at the framework root, no Versions/A/ subdir) —
+			// see setup-llamacpp.ps1 for why (Windows can't extract Apple
+			// versioned-framework symlinks reliably). Mac dyld accepts
+			// both flat and versioned layouts for dylib resolution, so the
+			// flattening is invisible at runtime.
+			//
+			// Universal binary: arm64 half is built with Metal (matches the
+			// Apple-Silicon-Macs-only GPU offload story); x86_64 half is
+			// CPU-only because upstream's CI Intel-Mac runner has no GPU
+			// to compile Metal against. No fallback handling needed in our
+			// code — the embedded Metal backend simply won't register on
+			// Intel Macs, and the runtime backend picker drops back to CPU.
+			string MacBinary = Path.Combine(MacFrameworkDir, "llama");
+			if (File.Exists(MacBinary))
+			{
+				RuntimeDependencies.Add(MacBinary);
+
+				// Stage the Info.plist + headers if they're present (cheap
+				// + harmless; lets debuggers and crash reporters pick up
+				// the framework's identity).
+				string InfoPlist = Path.Combine(MacFrameworkDir, "Resources", "Info.plist");
+				if (File.Exists(InfoPlist))
+				{
+					RuntimeDependencies.Add(InfoPlist);
+				}
+			}
+		}
+		else if (Target.Platform == UnrealTargetPlatform.IOS)
+		{
+			// iOS: PublicAdditionalFrameworks does double duty — adds
+			// `-framework llama` to the link command AND embeds
+			// llama.framework into the .app's Frameworks/ directory at
+			// packaging time. dyld auto-loads the framework at app launch
+			// before any UE module runs, so by the time our StartupModule
+			// fires every llama_* / ggml_* symbol is already in the
+			// process's global namespace.
+			//
+			// Why this differs from Win64/Android/Mac dynamic-load pattern:
+			//   iOS has no reliable equivalent of dlopen-by-full-path that
+			//   works across all supported iOS versions + signing modes
+			//   (App Store, ad-hoc, dev). Embedded frameworks must be
+			//   declared at build time so the code-signing pass picks them
+			//   up. Our InoLlama.cpp's iOS Init still populates the vtable
+			//   via dlsym(RTLD_DEFAULT, ...) so the consumer-facing API
+			//   stays uniform across platforms; only the load mechanism
+			//   differs.
+			//
+			// Currently we only ship the device slice (arm64). The
+			// simulator slice exists at Source/ThirdParty/IOS/Simulator/
+			// for development convenience but is not wired into the build
+			// — UE 5.7's iOS toolchain targets device builds in shipped
+			// game flow, and devs running in simulator typically use a
+			// dedicated simulator-targeted build configuration where the
+			// PublicAdditionalFrameworks Path can be flipped. (Future
+			// follow-up: detect Target.Architecture == sim and switch
+			// the framework path; not blocking initial iOS support.)
+			string IosDeviceFw = Path.Combine(IosBaseDir, "llama.framework");
+			if (Directory.Exists(IosDeviceFw))
+			{
+				PublicAdditionalFrameworks.Add(new Framework(
+					"llama",
+					IosDeviceFw,
+					/*CopyBundledAssets*/ null,
+					/*bCopyFramework*/ true));
+			}
+		}
+		// Linux: not yet implemented. Linking succeeds because no static
+		// references; runtime calls fail gracefully when the dynamic load
+		// can't find the library.
 	}
 }
