@@ -2,9 +2,11 @@
 
 #include "InoLlama.h"
 
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "Interfaces/IPluginManager.h"
+#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 
@@ -71,10 +73,14 @@ namespace
      */
     struct FDllHandles
     {
-        void* LibOmp      = nullptr;   // libomp140.x86_64.dll  (Windows only)
+        void* LibOmp      = nullptr;   // libomp140.x86_64.dll  (Windows only, preloaded from Plugins/Win64)
         void* GgmlBase    = nullptr;   // ggml-base.dll / libggml-base.so
         void* Ggml        = nullptr;   // ggml.dll / libggml.so
-        void* GgmlVulkan  = nullptr;   // ggml-vulkan.dll (Windows only)
+        void* GgmlVulkan  = nullptr;   // unused on Win64 since the Live Coding
+                                       // workaround moved Vulkan to the scratch
+                                       // dir loaded by ggml_backend_load_all_from_path
+                                       // (ggml owns that handle, not us).
+                                       // Slot kept for ABI parity with prior code.
         void* LlamaMain   = nullptr;   // llama.dll / libllama.so / llama.framework/llama
     };
     FDllHandles GHandles;
@@ -228,16 +234,27 @@ namespace
      *   ggml.dll              — Dispatcher; depends on ggml-base.dll.
      *                           Imports the backend API + exports the
      *                           ggml_backend_* entry points we resolve.
-     *   ggml-vulkan.dll       — Vulkan backend; depends on ggml +
-     *                           ggml-base + OS-provided vulkan-1.dll.
      *   llama.dll             — Main library; depends on ggml.dll.
      *                           Exports the llama_* entry points.
      *
-     * The 14 ggml-cpu-*.dll CPU variants are intentionally NOT preloaded
-     * here. ggml_backend_load_all_from_path (called at the end of
-     * Init()) glob-scans the directory for ggml-*.dll and dlopens each
-     * one individually — each variant's init probes the host CPU and
-     * rejects itself if the required instruction set isn't available.
+     * NOTE on ggml-vulkan.dll: explicitly NOT preloaded here. The Vulkan
+     * backend is loaded later by ggml_backend_load_all_from_path against
+     * the out-of-tree backend SCRATCH dir (see PrepareWin64BackendScratchDir),
+     * along with the CPU variants. Preloading Vulkan from the in-tree
+     * Plugins path here AND letting the scan re-load it from the scratch
+     * path would cause Windows to map it twice (the loader treats two
+     * distinct absolute paths as separate mappings) — which would re-
+     * trigger Live Coding's DLL-load notification on the in-tree path
+     * and reintroduce the spurious "Cannot enable" errors that the
+     * scratch-dir indirection exists to avoid.
+     *
+     * The 14 ggml-cpu-*.dll CPU variants are also intentionally NOT
+     * preloaded here. They are loaded from the scratch dir by
+     * ggml_backend_load_all_from_path; each variant's init probes the
+     * host CPU and rejects itself if the required instruction set isn't
+     * available, then ggml FreeLibrarys the rejected ones. Loading them
+     * from the scratch dir means the FreeLibrary'd variants are invisible
+     * to Live Coding's IsUEDll path filter.
      */
     bool PreloadWin64Deps(const FString& BinDir, FDllHandles& OutHandles)
     {
@@ -252,7 +269,6 @@ namespace
             { TEXT("libomp140.x86_64.dll"), true,  &OutHandles.LibOmp     },
             { TEXT("ggml-base.dll"),        true,  &OutHandles.GgmlBase   },
             { TEXT("ggml.dll"),             true,  &OutHandles.Ggml       },
-            { TEXT("ggml-vulkan.dll"),      false, &OutHandles.GgmlVulkan },
         };
 
         for (const FPreload& P : Preloads)
@@ -285,6 +301,141 @@ namespace
             }
         }
         return true;
+    }
+
+    /**
+     * Read the staged llama.cpp build tag from
+     * Source/ThirdParty/.llamacpp_version (written by setup-llamacpp.ps1).
+     * Used to namespace the backend scratch dir so version bumps invalidate
+     * the cached copies cleanly. Returns "unknown" on any failure — the
+     * scratch dir still works, the cache key just becomes coarse.
+     */
+    FString ReadStagedLlamaCppVersion()
+    {
+        const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("InoLlama"));
+        if (!Plugin.IsValid())
+        {
+            return TEXT("unknown");
+        }
+        const FString StampPath = FPaths::Combine(
+            Plugin->GetBaseDir(), TEXT("Source/ThirdParty/.llamacpp_version"));
+        FString StampContents;
+        if (!FFileHelper::LoadFileToString(StampContents, *StampPath))
+        {
+            return TEXT("unknown");
+        }
+        return StampContents.TrimStartAndEnd();
+    }
+
+    /**
+     * Stage every ggml backend DLL we ship (ggml-vulkan + 14 ggml-cpu-*
+     * variants) into a per-version scratch dir under %TEMP%, then return
+     * its absolute path. Idempotent on a per-source-DLL basis (size +
+     * mtime check; nothing is copied if the scratch copies are current).
+     *
+     * Why this exists — Live Coding side-step:
+     *
+     *   UE 5.7's Live Coding subsystem hooks every Windows DLL load via
+     *   LDR_DLL_NOTIFICATION_REASON_LOADED and routes anything whose full
+     *   path lives under {FullEngineDir, FullEnginePluginsDir, FullProjectDir,
+     *   FullProjectPluginsDir} into its hot-patch enable queue
+     *   (FLiveCodingModule::IsUEDll filters by StartsWith on those four
+     *   roots). When ggml_backend_load_all_from_path glob-loads all 14
+     *   ggml-cpu-*.dll variants from Source/ThirdParty/Win64/, then ggml
+     *   FreeLibrarys the 13 whose host-CPU score probe failed, Live Coding
+     *   has already queued each — and at the next Tick logs
+     *   "Cannot enable module X because it is not loaded by this process"
+     *   for every unloaded variant. Same fate for ggml-vulkan.dll on a
+     *   host without a Vulkan device.
+     *
+     *   The fix is to load these backend DLLs from a path OUTSIDE every
+     *   UE-known dir. %TEMP%/InoLlama_LlamaCpp_Backends_<version>/ is
+     *   under the user-temp tree, which IsUEDll's StartsWith checks all
+     *   miss → notifications for the variants are dropped at the IsUEDll
+     *   gate → Live Coding never queues them → no "Cannot enable" errors.
+     *
+     *   The four "main" libs (libomp, ggml-base, ggml, llama) are kept
+     *   in their original Plugins/Win64 path and preloaded as before;
+     *   Live Coding sees them once at preload, but they stay loaded for
+     *   the process lifetime so GetModuleHandleW always succeeds and no
+     *   error is logged.
+     *
+     *   The previous fix in InoLlama.Build.cs that excluded the variants
+     *   from the Editor target's RuntimeDependencies was based on a
+     *   misdiagnosis (Live Coding does NOT scan RuntimeDependencies; it
+     *   reads the OS DLL-load notification stream). It is harmless and
+     *   left in place for the cooked-build packaging shape it produces.
+     */
+    FString PrepareWin64BackendScratchDir(const FString& OriginalBinDir)
+    {
+        const FString StagedVersion = ReadStagedLlamaCppVersion();
+        const FString ScratchDir = FPaths::Combine(
+            FString(FPlatformProcess::UserTempDir()),
+            FString::Printf(TEXT("InoLlama_LlamaCpp_Backends_%s"), *StagedVersion));
+
+        IFileManager& FM = IFileManager::Get();
+        FM.MakeDirectory(*ScratchDir, /*Tree=*/true);
+
+        // Source list: Vulkan + every ggml-cpu-*.dll the staging step
+        // produced. FindFiles returns just the leaf names; expand to full
+        // paths for the copy step.
+        TArray<FString> CpuLeafNames;
+        FM.FindFiles(CpuLeafNames,
+                     *FPaths::Combine(OriginalBinDir, TEXT("ggml-cpu-*.dll")),
+                     /*Files=*/true,
+                     /*Dirs=*/false);
+
+        TArray<FString> SourcePaths;
+        SourcePaths.Reserve(CpuLeafNames.Num() + 1);
+        for (const FString& Leaf : CpuLeafNames)
+        {
+            SourcePaths.Add(FPaths::Combine(OriginalBinDir, Leaf));
+        }
+        const FString VulkanSrc = FPaths::Combine(OriginalBinDir, TEXT("ggml-vulkan.dll"));
+        if (FM.FileExists(*VulkanSrc))
+        {
+            SourcePaths.Add(VulkanSrc);
+        }
+
+        int32 CopiedCount = 0;
+        int32 SkippedCount = 0;
+        for (const FString& SrcPath : SourcePaths)
+        {
+            const FString DstPath = FPaths::Combine(ScratchDir, FPaths::GetCleanFilename(SrcPath));
+            const int64 SrcSize = FM.FileSize(*SrcPath);
+            const int64 DstSize = FM.FileSize(*DstPath);
+            const FDateTime SrcTime = FM.GetTimeStamp(*SrcPath);
+            const FDateTime DstTime = FM.GetTimeStamp(*DstPath);
+            if (SrcSize <= 0)
+            {
+                continue; // shouldn't happen — staging would have failed
+            }
+            if (DstSize == SrcSize && DstTime >= SrcTime)
+            {
+                ++SkippedCount;
+                continue;
+            }
+            const uint32 CopyResult = FM.Copy(*DstPath, *SrcPath, /*bReplace=*/true);
+            if (CopyResult == COPY_OK)
+            {
+                ++CopiedCount;
+            }
+            else
+            {
+                UE_LOG(LogInoLlama, Warning,
+                       TEXT("LlamaCpp: Module: failed to copy backend DLL %s -> %s (FM::Copy=%u). ")
+                       TEXT("Will fall back to original Plugins-tree location for this DLL ")
+                       TEXT("(Live Coding may log a spurious 'Cannot enable' error)."),
+                       *SrcPath, *DstPath, CopyResult);
+            }
+        }
+
+        UE_LOG(LogInoLlama, Log,
+               TEXT("LlamaCpp: Module: backend scratch dir = %s ")
+               TEXT("(%d copied this session, %d already current, %d total)"),
+               *ScratchDir, CopiedCount, SkippedCount, SourcePaths.Num());
+
+        return ScratchDir;
     }
 #endif // PLATFORM_WINDOWS
 
@@ -562,11 +713,19 @@ bool Init()
 #if PLATFORM_WINDOWS
     if (GApi.ggml_backend_load_all_from_path != nullptr)
     {
-        const FTCHARToUTF8 BinDirUtf8(*BinDir);
-        GApi.ggml_backend_load_all_from_path(BinDirUtf8.Get());
+        // Scan the out-of-tree scratch dir, NOT the original Plugins
+        // staging dir. See PrepareWin64BackendScratchDir's comment for
+        // the Live Coding rationale (variant DLLs that get FreeLibrary'd
+        // after a failed CPU score probe must not have been observed by
+        // Live Coding's DLL-load notification hook, which means they
+        // must be loaded from a path that IsUEDll rejects).
+        const FString ScratchDir = PrepareWin64BackendScratchDir(BinDir);
+        const FTCHARToUTF8 ScratchDirUtf8(*ScratchDir);
+        GApi.ggml_backend_load_all_from_path(ScratchDirUtf8.Get());
         UE_LOG(LogInoLlama, Log,
-               TEXT("LlamaCpp: Module: ggml_backend_load_all_from_path(%s) invoked."),
-               *BinDir);
+               TEXT("LlamaCpp: Module: ggml_backend_load_all_from_path(%s) invoked ")
+               TEXT("(scratch dir; loads CPU variants + Vulkan backend from outside the UE tree)."),
+               *ScratchDir);
     }
 #elif PLATFORM_ANDROID
     // Android: ggml_backend_load_all_from_path can't enumerate the APK's

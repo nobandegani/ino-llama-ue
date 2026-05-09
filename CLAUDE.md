@@ -427,39 +427,54 @@ unregistered.
 
 ### UE 5.7 Live Coding interaction (Win64 editor)
 
-UE 5.7's Live Coding scans every entry in the editor target's
-`RuntimeDependencies` list and tries to "enable" each as a UE module
-for hot-patching. With 14 ggml-cpu variants of which only one ever
-loads (the host-CPU match), Live Coding logs 13 spurious
+When the editor opens with InoLlama enabled, UE 5.7's Live Coding
+subsystem hooks every Windows DLL load via
+`LDR_DLL_NOTIFICATION_REASON_LOADED` (see
+`Engine/Source/Developer/Windows/LiveCoding/Private/LiveCodingModule.cpp::OnDllLoaded`)
+and routes anything whose full path lives under
+`{FullEngineDir, FullEnginePluginsDir, FullProjectDir, FullProjectPluginsDir}`
+into its hot-patch enable queue (`FLiveCodingModule::IsUEDll` filters by
+`StartsWith` on those four roots).
+
+When `ggml_backend_load_all_from_path` glob-loads all 14
+`ggml-cpu-*.dll` variants from `Source/ThirdParty/Win64/`, then
+`ggml` `FreeLibrary`s the 13 whose host-CPU score probe failed,
+Live Coding has already queued each — and at the next Tick logs
 `Cannot enable module X because it is not loaded by this process`
-Errors at editor startup. The legacy `StagedFileType.SystemNonUFS`
-hint that older UE versions used to skip these is no longer respected
-in 5.7.
+for every unloaded variant. Same fate for `ggml-vulkan.dll` on a
+host without a Vulkan device.
 
-The fix in `InoLlama.Build.cs` is to **exclude the variant glob from
-the editor target's `RuntimeDependencies`**:
+**The fix lives in `InoLlama.cpp`'s `Init()`**, not in the build
+graph: at module startup we copy every backend DLL (Vulkan + the
+14 CPU variants) into a per-version scratch dir under `%TEMP%`
+(e.g. `%TEMP%/InoLlama_LlamaCpp_Backends_b9016/`) and call
+`ggml_backend_load_all_from_path` against THAT path instead of
+the in-tree `Source/ThirdParty/Win64/`. `IsUEDll`'s `StartsWith`
+check rejects `%TEMP%/...`, so the variants' load notifications
+are filtered out at the Live Coding gate and never reach the
+hot-patch queue. The four "main" libs (`libomp140.x86_64.dll`,
+`ggml-base.dll`, `ggml.dll`, `llama.dll`) stay in their original
+Plugins path and are preloaded as before — Live Coding sees them
+once at preload, but they stay loaded for the process lifetime so
+`GetModuleHandleW` always succeeds and no error is logged.
 
-```csharp
-if (Target.Type != TargetType.Editor && Directory.Exists(Win64Dir))
-{
-    // ... add ggml-cpu-*.dll entries ...
-}
-```
+Vulkan is intentionally NOT in `PreloadWin64Deps`'s list anymore.
+If we preloaded Vulkan from the Plugins path AND let the scratch
+scan also map it, Windows' loader would treat the two distinct
+absolute paths as separate mappings and re-trigger the Live
+Coding hook on the in-tree path. The scratch scan is the sole
+load site for Vulkan now.
 
-The editor still loads the variants at runtime via
-`ggml_backend_load_all_from_path`'s directory scan of
-`Source/ThirdParty/Win64/` — `RuntimeDependencies` isn't on the
-load-path side of the equation. Game/Server targets keep the
-declarations so the cook + stage step for shipping builds still
-packages every variant. Zero behavior change on either side; Live
-Coding just stops complaining about DLLs it can't patch.
-
-The `RequiredWin64` DLLs (`llama.dll`, `ggml.dll`, `ggml-base.dll`,
-`ggml-vulkan.dll`, `libomp140.x86_64.dll`) ARE kept in the editor
-target's `RuntimeDependencies` because they're actually loaded by
-the editor process — Live Coding finds them in the loaded-modules
-list and is happy. The Android branch doesn't need an equivalent
-guard because Android targets are never `TargetType.Editor`.
+**Historical note (do not reintroduce):** an earlier guard in
+`InoLlama.Build.cs` that excluded `ggml-cpu-*.dll` from the editor
+target's `RuntimeDependencies` was based on a misdiagnosis (Live
+Coding does NOT scan `RuntimeDependencies`; it reads the OS DLL-
+load notification stream). The guard is harmless and left in place
+because it produces a sensible cooked-build packaging shape on
+shipping targets, but it is not what suppresses the editor errors.
+The Android branch doesn't need any equivalent because Android
+targets are never `TargetType.Editor` and the Android linker /
+backend-loading path doesn't trip the Live Coding hook anyway.
 
 ## Authoritative references
 
