@@ -498,6 +498,27 @@ $ConfigureArgs = @(
     "-DANDROID_ABI=arm64-v8a",
     "-DANDROID_PLATFORM=$AndroidPlatform",
     "-DCMAKE_INSTALL_PREFIX=$InstallDir",
+    # Strip absolute build paths out of the produced .so files.
+    #
+    # ggml's GGML_ASSERT / GGML_ABORT macros embed __FILE__, and unlike a
+    # plain assert() they are NOT compiled out by NDEBUG in a Release
+    # build — the assertion text has to survive to be useful. Without a
+    # prefix map, every __FILE__ expands to this machine's absolute path,
+    # so the shipped libraries carry the builder's directory layout (and
+    # therefore their OS username and any internal project naming) into
+    # every consuming game. libllama.so alone embedded 154 distinct
+    # absolute paths before this was added.
+    #
+    # -ffile-prefix-map rewrites __FILE__, debug info, and profiling
+    # paths together. Two maps: the vendored source dir and the build
+    # dir, both collapsed to short relative stems so assertion messages
+    # stay readable (".../src/llama-model.cpp" rather than a bare
+    # basename).
+    #
+    # Win64 / Mac / iOS don't need this — they come from upstream's
+    # release artifacts, built on upstream CI.
+    "-DCMAKE_C_FLAGS=-ffile-prefix-map=$VendorSrcDir=llama.cpp -ffile-prefix-map=$BuildDir=build",
+    "-DCMAKE_CXX_FLAGS=-ffile-prefix-map=$VendorSrcDir=llama.cpp -ffile-prefix-map=$BuildDir=build",
     # ggml backend toggles
     "-DGGML_NATIVE=OFF",
     "-DGGML_BACKEND_DL=ON",

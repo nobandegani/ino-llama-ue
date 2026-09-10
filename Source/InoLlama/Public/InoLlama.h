@@ -68,10 +68,17 @@ public:
  * gated on a null check against GetApi().
  *
  * Init() on Windows:
- *   - PreloadWin64Deps(): loads libomp140.x86_64.dll, ggml-base.dll,
- *     ggml.dll, ggml-vulkan.dll by full path so Windows' loaded-modules
- *     cache is seeded with OUR copies before llama.dll's PE imports
- *     are resolved. Load order is intentional (dependencies first).
+ *   - PreloadWin64Deps(): loads libomp140.x86_64.dll, ggml-base.dll and
+ *     ggml.dll by full path so Windows' loaded-modules cache is seeded
+ *     with OUR copies before llama.dll's PE imports are resolved. Load
+ *     order is intentional (dependencies first). All three are marked
+ *     required — a failure here aborts init.
+ *
+ *     Note that ggml-vulkan.dll is deliberately NOT in that list: it is
+ *     a *backend*, not a link-time dependency of llama.dll, so it gets
+ *     picked up later by ggml_backend_load_all_from_path along with the
+ *     14 CPU variants. Preloading it here would only bypass the score
+ *     check that filters backends the host can't use.
  *   - FPlatformProcess::GetDllHandle on llama.dll (full path).
  *   - FPlatformProcess::GetDllExport to resolve every function pointer
  *     in FLlamaCppApi. ggml_* symbols are exported from ggml.dll /
@@ -91,9 +98,25 @@ public:
  *     but not preloaded — ggml_backend_load_all_from_path dlopens them
  *     on demand once we've resolved its function pointer.
  *
- * Init() on iOS / Linux / macOS:
- *   - Warns. GetApi() returns nullptr. Every consumer null-checks the
- *     return and handles gracefully.
+ * Init() on macOS:
+ *   - GetDllHandle on Source/ThirdParty/Mac/llama.framework/llama (full
+ *     path). The upstream XCFramework slice is one dylib with llama +
+ *     ggml + ggml-cpu + ggml-metal + ggml-blas statically linked in, and
+ *     backends self-register via static-init constructors at dylib load,
+ *     so there is no ggml_backend_load_all_from_path step.
+ *
+ * Init() on iOS:
+ *   - Nothing to load. The framework is embedded in the .app and dyld
+ *     has already mapped it by the time StartupModule runs, so
+ *     ResolveMainLibraryPath returns an empty path as a sentinel and the
+ *     vtable resolves via dlsym(RTLD_DEFAULT) against the process's
+ *     global namespace. iOS forbids dlopen of arbitrary paths in
+ *     submitted apps, so this is the only workable route.
+ *
+ * Init() on Linux:
+ *   - Warns. GetApi() returns nullptr — no staged binaries for that
+ *     platform. Every consumer null-checks the return and handles
+ *     gracefully.
  */
 namespace InoAgents::LlamaCpp
 {
