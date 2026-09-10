@@ -77,8 +77,15 @@ raw C structs.
 
 ## Requirements
 
-**To consume it:** Unreal Engine 5 (developed against 5.7). Prebuilt binaries for all four
-platforms are committed, so a clean clone compiles without a toolchain.
+**To consume it:** Unreal Engine 5 (developed against 5.7). Prebuilt binaries for **Win64, macOS
+and iOS** are committed, so a clean clone compiles without a toolchain for those.
+
+> **⚠️ Android libraries are not committed.** The previously committed `arm64-v8a` `.so` files
+> embedded absolute build paths (ggml's `GGML_ASSERT` expands `__FILE__` and survives a Release
+> build — `libllama.so` alone carried 154 of them), so they were removed. **Run
+> `LlamaCpp/scripts/setup-llamacpp.ps1` to rebuild them** — it now passes `-ffile-prefix-map`, so
+> the result is clean. Until you do, Android builds have no llama.cpp to load and `GetApi()`
+> returns `nullptr` there.
 
 **To re-stage the runtime:** PowerShell, plus the Android SDK/NDK if you are rebuilding the
 Android libraries. See [Staging the runtime](#staging-the-runtime).
